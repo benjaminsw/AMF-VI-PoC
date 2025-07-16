@@ -45,6 +45,8 @@ class RealNVPFlow(BaseFlow):
         log_det_total = torch.zeros(x.size(0), device=x.device)
         
         for i, mask in enumerate(self.masks):
+            # Ensure mask is on the same device as input
+            mask = mask.to(x.device)
             z_masked = z * mask
             
             # Compute scale and translate
@@ -64,7 +66,7 @@ class RealNVPFlow(BaseFlow):
         
         # Apply inverse transformations in reverse order
         for i in reversed(range(len(self.masks))):
-            mask = self.masks[i]
+            mask = self.masks[i].to(z.device)  # Ensure mask is on the same device
             x_masked = x * mask
             
             s = self.scale_nets[i](x_masked) * (1 - mask)

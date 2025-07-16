@@ -68,8 +68,10 @@ class SimpleAMFVI(nn.Module):
     
     def sample(self, n_samples: int) -> torch.Tensor:
         """Sample from the mixture."""
+        device = next(self.parameters()).device
+        
         # Sample component assignments
-        component_probs = torch.ones(len(self.flows)) / len(self.flows)
+        component_probs = torch.ones(len(self.flows), device=device) / len(self.flows)
         components = torch.multinomial(component_probs, n_samples, replacement=True)
         
         samples = []
@@ -91,8 +93,10 @@ class SimpleAMFVI(nn.Module):
     
     def regularization_loss(self) -> torch.Tensor:
         """Simple mode separation regularization."""
+        device = next(self.parameters()).device
+        
         if len(self.flows) < 2:
-            return torch.tensor(0.0)
+            return torch.tensor(0.0, device=device)
         
         # Sample from each flow and encourage diversity
         n_samples = 50
@@ -102,7 +106,7 @@ class SimpleAMFVI(nn.Module):
             samples.append(flow_samples.mean(dim=0))  # Mean of each flow
         
         # Encourage different means
-        total_loss = torch.tensor(0.0)
+        total_loss = torch.tensor(0.0, device=device)
         for i in range(len(samples)):
             for j in range(i + 1, len(samples)):
                 dist = torch.norm(samples[i] - samples[j])
