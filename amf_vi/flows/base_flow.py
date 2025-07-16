@@ -29,5 +29,5 @@ class BaseFlow(nn.Module, ABC):
     def log_prob(self, x: torch.Tensor) -> torch.Tensor:
         """Compute log probability."""
         z, log_det = self.forward_and_log_det(x)
-        log_prob_base = -0.5 * (z**2).sum(dim=1) - 0.5 * self.dim * torch.log(2 * torch.pi)
+        log_prob_base = -0.5 * (z**2).sum(dim=1) - 0.5 * self.dim * torch.log(torch.tensor(2 * torch.pi))
         return log_prob_base + log_det

@@ -18,7 +18,7 @@ class SimpleIWAELoss(nn.Module):
         weighted_log_probs = log_prob_components + torch.log(weights + 1e-8)
         
         # For simplicity, use the mixture log probability as IWAE approximation
-        iwae_bound = torch.logsumexp(weighted_log_probs, dim=1)
+        iwae_bound = torch.logsumexp(weighted_log_probs, dim=1).clone()
         
         # Add target log probability if available (for supervised case)
         if target_log_prob_fn is not None:
