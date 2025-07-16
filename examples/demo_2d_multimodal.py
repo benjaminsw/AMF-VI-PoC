@@ -49,21 +49,15 @@ def train_amf_vi(show_plots=True, save_plots=False):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     data = data.to(device)
     model = model.to(device)
-    model = model.cuda() if torch.cuda.is_available() else model
     
     print(f"🏗️ Model created with {len(model.flows)} flows: {['realnvp', 'planar', 'radial']}")
     
     # Setup training with lower learning rate for stability
-    optimizer = optim.Adam(model.parameters(), lr=1e-3) #start high  #lr=5e-4
-    ####################################################
-    # Add scheduler - choose one:
-    # Option 1: Step decay (most common)
+    optimizer = optim.Adam(model.parameters(), lr=5e-4)  # Lower learning rate
+    
+    # Add scheduler
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=200, gamma=0.7)
-    # Option 2: Cosine annealing (smooth)
-    # scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
-    # Option 3: Exponential decay
-    # scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99)
-    #####################################################
+    
     loss_fn = SimpleIWAELoss(n_importance_samples=5)
     
     # Training loop with loss tracking
@@ -124,19 +118,26 @@ def train_amf_vi(show_plots=True, save_plots=False):
             # Backward pass with gradient clipping
             loss.backward()
             
-            # Check gradients for NaN
+            # FIX 1: More aggressive gradient clipping and NaN check
+            total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+            
+            # Check for extremely small gradients that can become NaN
+            if total_norm < 1e-10:
+                print(f"⚠️ Extremely small gradients detected at epoch {epoch}, skipping step")
+                continue
+            
+            # Check gradients for NaN after clipping
             grad_nan = False
             for name, param in model.named_parameters():
-                if param.grad is not None and check_for_nan(param.grad, f"gradient {name}"):
-                    grad_nan = True
-                    break
+                if param.grad is not None:
+                    if torch.isnan(param.grad).any():
+                        print(f"❌ NaN in gradient {name} at epoch {epoch}, batch {i//batch_size}")
+                        grad_nan = True
+                        break
             
             if grad_nan:
                 print(f"❌ NaN in gradients at epoch {epoch}, batch {i//batch_size}")
                 break
-            
-            # Clip gradients for stability
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
             optimizer.step()
             
@@ -152,10 +153,8 @@ def train_amf_vi(show_plots=True, save_plots=False):
         epoch_losses.append(avg_epoch_loss)
         losses.extend([avg_epoch_loss])  # For compatibility with plotting functions
         
-        ###############################
         # scheduler to update lr
         scheduler.step()
-        ###############################
         
         if epoch % 50 == 0:
             print(f"📈 Epoch {epoch}: Loss = {avg_epoch_loss:.4f}")
@@ -204,12 +203,12 @@ def train_amf_vi(show_plots=True, save_plots=False):
                 except Exception as e:
                     print(f"⚠️ Error sampling from {name} flow: {e}")
         
-        # Print statistics
+        # FIX 2: Add .cpu() to convert CUDA tensors to CPU for numpy
         print(f"\n📊 Final Results:")
-        print(f"   Target data mean: {data.mean(dim=0).numpy()}")
-        print(f"   Model samples mean: {model_samples.mean(dim=0).numpy()}")
-        print(f"   Target data std: {data.std(dim=0).numpy()}")
-        print(f"   Model samples std: {model_samples.std(dim=0).numpy()}")
+        print(f"   Target data mean: {data.mean(dim=0).cpu().numpy()}")
+        print(f"   Model samples mean: {model_samples.mean(dim=0).cpu().numpy()}")
+        print(f"   Target data std: {data.std(dim=0).cpu().numpy()}")
+        print(f"   Model samples std: {model_samples.std(dim=0).cpu().numpy()}")
         
         if show_plots:
             print("📊 Displaying comprehensive results...")
