@@ -51,6 +51,7 @@ class RealNVPFlow(BaseFlow):
             
             # Compute scale and translate
             s = self.scale_nets[i](z_masked) * (1 - mask)
+            s = torch.clamp(s, min=-10, max=10)  # Prevent extreme values
             t = self.translate_nets[i](z_masked) * (1 - mask)
             
             # Apply transformation
