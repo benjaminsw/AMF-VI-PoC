@@ -72,8 +72,19 @@ def comprehensive_evaluation():
     print("Loading pre-trained model...")
     
     # Load pre-trained model
-    with open('/content/results/trained_model.pkl', 'rb') as f:
+    model_path = '/content/results/trained_model.pkl'
+    if not os.path.exists(model_path):
+        print(f"Model file not found at {model_path}")
+        print("Please run the training script first: python examples/demo_2d_multimodal.py")
+        return None
+    
+    with open(model_path, 'rb') as f:
         model = pickle.load(f)
+    
+    # FIX: Ensure model and data are on the same device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
+    test_data = test_data.to(device)
     
     print("\nEvaluating model...")
     
@@ -118,8 +129,8 @@ def comprehensive_evaluation():
     plot_samples(test_data, "Target Data", axes[0, 0])
     plot_samples(generated_samples, "AMF-VI Mixture", axes[0, 1])
     
-    # Plot flow separation matrix - FIX: Add .detach()
-    pairwise_dists = diversity_metrics['pairwise_distances'].detach().numpy()
+    # Plot flow separation matrix - FIX: Add .detach().cpu()
+    pairwise_dists = diversity_metrics['pairwise_distances'].detach().cpu().numpy()
     im = axes[0, 2].imshow(pairwise_dists, cmap='viridis')
     axes[0, 2].set_title("Flow Separation Matrix")
     plt.colorbar(im, ax=axes[0, 2])
@@ -130,6 +141,9 @@ def comprehensive_evaluation():
             plot_samples(samples, f"{name.capitalize()} Flow", axes[1, i])
     
     plt.tight_layout()
+    
+    # Create results directory if it doesn't exist
+    os.makedirs('/results', exist_ok=True)
     plt.savefig('/results/evaluation_plots.png', dpi=300, bbox_inches='tight')
     plt.show()
     
@@ -137,7 +151,7 @@ def comprehensive_evaluation():
     os.makedirs('/results', exist_ok=True)
     
     # Save metrics to text file
-    with open('/content/results/evaluation_results.txt', 'w') as f:
+    with open('/results/evaluation_results.txt', 'w') as f:
         f.write("Evaluation Results\n")
         f.write("==================\n")
         f.write(f"Coverage: {coverage:.6f}\n")
@@ -152,7 +166,7 @@ def comprehensive_evaluation():
                    f"Std: [{std[0]:.2f}, {std[1]:.2f}]\n")
     
     # Save metrics to CSV
-    with open('/results/metrics.csv', 'w', newline='') as f:
+    with open('/content/results/metrics.csv', 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['metric', 'value'])
         writer.writerow(['coverage', coverage])
