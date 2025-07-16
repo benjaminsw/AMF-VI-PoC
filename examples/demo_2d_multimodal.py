@@ -54,11 +54,20 @@ def train_amf_vi(show_plots=True, save_plots=False):
     print(f"🏗️ Model created with {len(model.flows)} flows: {['realnvp', 'planar', 'radial']}")
     
     # Setup training with lower learning rate for stability
-    optimizer = optim.Adam(model.parameters(), lr=5e-4)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3) #start high  #lr=5e-4
+    ####################################################
+    # Add scheduler - choose one:
+    # Option 1: Step decay (most common)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=200, gamma=0.7)
+    # Option 2: Cosine annealing (smooth)
+    # scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
+    # Option 3: Exponential decay
+    # scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99)
+    #####################################################
     loss_fn = SimpleIWAELoss(n_importance_samples=5)
     
     # Training loop with loss tracking
-    n_epochs = 1000
+    n_epochs = 500
     batch_size = 64
     losses = []
     epoch_losses = []
@@ -142,6 +151,11 @@ def train_amf_vi(show_plots=True, save_plots=False):
         avg_epoch_loss = total_loss / batch_count if batch_count > 0 else float('inf')
         epoch_losses.append(avg_epoch_loss)
         losses.extend([avg_epoch_loss])  # For compatibility with plotting functions
+        
+        ###############################
+        # scheduler to update lr
+        scheduler.step()
+        ###############################
         
         if epoch % 50 == 0:
             print(f"📈 Epoch {epoch}: Loss = {avg_epoch_loss:.4f}")
