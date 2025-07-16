@@ -14,6 +14,8 @@ from amf_vi.utils import (
     plot_flow_weights_distribution,
     save_all_plots
 )
+import pickle
+import os
 
 def check_for_nan(tensor, name="tensor"):
     """Diagnostic function to check for NaN values."""
@@ -53,7 +55,7 @@ def train_amf_vi(show_plots=True, save_plots=False):
     print(f"🏗️ Model created with {len(model.flows)} flows: {['realnvp', 'planar', 'radial']}")
     
     # Setup training with lower learning rate for stability
-    optimizer = optim.Adam(model.parameters(), lr=5e-4)  # Lower learning rate
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)  #lr = 5e-4 # Lower learning rate
     
     # Add scheduler
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=200, gamma=0.7)
@@ -251,7 +253,13 @@ def train_amf_vi(show_plots=True, save_plots=False):
                 print("✅ All plots saved successfully!")
             except Exception as e:
                 print(f"⚠️ Error saving plots: {e}")
-    
+
+    # Save trained model
+    os.makedirs('/content/results', exist_ok=True)
+    with open('/content/results/trained_model.pkl', 'wb') as f:
+        pickle.dump(model, f)
+    print("✅ Model saved to /content/results/trained_model.pkl")
+
     return model, epoch_losses
 
 if __name__ == "__main__":

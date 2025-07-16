@@ -5,6 +5,9 @@ from sklearn.metrics import pairwise_distances
 from scipy.spatial.distance import cdist
 from amf_vi.model import SimpleAMFVI
 from amf_vi.utils import create_multimodal_data, plot_samples
+import os
+import pickle
+import csv
 
 def compute_coverage(target_samples, generated_samples, threshold=0.1):
     """Compute mode coverage metric."""
@@ -66,26 +69,11 @@ def comprehensive_evaluation():
     # Create test data
     test_data = create_multimodal_data(2000)
     
-    print("Training AMF-VI model...")
+    print("Loading pre-trained model...")
     
-    # Create and train model
-    model = SimpleAMFVI(dim=2, flow_types=['realnvp', 'planar', 'radial'])
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    
-    # Quick training
-    for epoch in range(200):
-        optimizer.zero_grad()
-        output = model(test_data)
-        
-        # Simple negative log likelihood
-        mixture_log_prob = model.log_prob_mixture(test_data)
-        loss = -mixture_log_prob.mean() + model.regularization_loss()
-        
-        loss.backward()
-        optimizer.step()
-        
-        if epoch % 50 == 0:
-            print(f"Epoch {epoch}: Loss = {loss.item():.4f}")
+    # Load pre-trained model
+    with open('/content/results/trained_model.pkl', 'rb') as f:
+        model = pickle.load(f)
     
     print("\nEvaluating model...")
     
@@ -105,9 +93,14 @@ def comprehensive_evaluation():
     quality = compute_quality(test_data, generated_samples)
     diversity_metrics = evaluate_flow_diversity(model)
     
+    # Compute log probability
+    with torch.no_grad():
+        log_prob = model.log_prob_mixture(test_data).mean().item()
+    
     print(f"\nEvaluation Results:")
     print(f"Coverage: {coverage:.3f}")
     print(f"Quality: {quality:.3f}")
+    print(f"Log Probability: {log_prob:.3f}")
     print(f"Flow Separation: {diversity_metrics['avg_separation']:.3f}")
     
     # Detailed flow analysis
@@ -125,8 +118,8 @@ def comprehensive_evaluation():
     plot_samples(test_data, "Target Data", axes[0, 0])
     plot_samples(generated_samples, "AMF-VI Mixture", axes[0, 1])
     
-    # Plot flow separation matrix
-    pairwise_dists = diversity_metrics['pairwise_distances'].numpy()
+    # Plot flow separation matrix - FIX: Add .detach()
+    pairwise_dists = diversity_metrics['pairwise_distances'].detach().numpy()
     im = axes[0, 2].imshow(pairwise_dists, cmap='viridis')
     axes[0, 2].set_title("Flow Separation Matrix")
     plt.colorbar(im, ax=axes[0, 2])
@@ -137,7 +130,39 @@ def comprehensive_evaluation():
             plot_samples(samples, f"{name.capitalize()} Flow", axes[1, i])
     
     plt.tight_layout()
+    plt.savefig('/content/results/evaluation_plots.png', dpi=300, bbox_inches='tight')
     plt.show()
+    
+    # Save results to file
+    os.makedirs('/content/results', exist_ok=True)
+    
+    # Save metrics to text file
+    with open('/content/results/evaluation_results.txt', 'w') as f:
+        f.write("Evaluation Results\n")
+        f.write("==================\n")
+        f.write(f"Coverage: {coverage:.6f}\n")
+        f.write(f"Quality: {quality:.6f}\n")
+        f.write(f"Log Probability: {log_prob:.6f}\n")
+        f.write(f"Flow Separation: {diversity_metrics['avg_separation']:.6f}\n\n")
+        f.write("Flow Analysis:\n")
+        for name, samples in flow_samples.items():
+            mean = samples.mean(dim=0)
+            std = samples.std(dim=0)
+            f.write(f"{name.capitalize()} Flow - Mean: [{mean[0]:.2f}, {mean[1]:.2f}], "
+                   f"Std: [{std[0]:.2f}, {std[1]:.2f}]\n")
+    
+    # Save metrics to CSV
+    with open('/content/results/metrics.csv', 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['metric', 'value'])
+        writer.writerow(['coverage', coverage])
+        writer.writerow(['quality', quality])
+        writer.writerow(['log_probability', log_prob])
+        writer.writerow(['flow_separation', diversity_metrics['avg_separation']])
+    
+    print(f"\nResults saved to /content/results/evaluation_results.txt")
+    print(f"Metrics saved to /content/results/metrics.csv")
+    print(f"Plots saved to /content/results/evaluation_plots.png")
     
     return {
         'coverage': coverage,
