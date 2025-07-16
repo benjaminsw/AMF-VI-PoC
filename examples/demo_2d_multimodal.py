@@ -255,10 +255,10 @@ def train_amf_vi(show_plots=True, save_plots=False):
                 print(f"⚠️ Error saving plots: {e}")
 
     # Save trained model
-    os.makedirs('/content/results', exist_ok=True)
-    with open('/content/results/trained_model.pkl', 'wb') as f:
+    os.makedirs('/results', exist_ok=True)
+    with open('/results/trained_model.pkl', 'wb') as f:
         pickle.dump(model, f)
-    print("✅ Model saved to /content/results/trained_model.pkl")
+    print("✅ Model saved to /results/trained_model.pkl")
 
     return model, epoch_losses
 
