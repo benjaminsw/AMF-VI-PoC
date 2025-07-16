@@ -45,6 +45,11 @@ def train_amf_vi(show_plots=True, save_plots=False):
         flow_types=['realnvp', 'planar', 'radial'],
         n_components=3
     )
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    data = data.to(device)
+    model = model.to(device)
+    model = model.cuda() if torch.cuda.is_available() else model
     
     print(f"🏗️ Model created with {len(model.flows)} flows: {['realnvp', 'planar', 'radial']}")
     
@@ -53,7 +58,7 @@ def train_amf_vi(show_plots=True, save_plots=False):
     loss_fn = SimpleIWAELoss(n_importance_samples=5)
     
     # Training loop with loss tracking
-    n_epochs = 200
+    n_epochs = 1000
     batch_size = 64
     losses = []
     epoch_losses = []
@@ -62,14 +67,14 @@ def train_amf_vi(show_plots=True, save_plots=False):
     
     for epoch in range(n_epochs):
         # Mini-batch training
-        perm = torch.randperm(len(data))
+        perm = torch.randperm(len(data), device=device)
         total_loss = 0
         nan_detected = False
         batch_count = 0
         
         for i in range(0, len(data), batch_size):
             indices = perm[i:i+batch_size]
-            batch = data[indices]
+            batch = data[indices].to(device) 
             
             # Check input for NaN
             if check_for_nan(batch, "input batch"):
