@@ -254,11 +254,14 @@ def train_amf_vi(show_plots=True, save_plots=False):
             except Exception as e:
                 print(f"⚠️ Error saving plots: {e}")
 
-    # Save trained model
-    os.makedirs('/results', exist_ok=True)
-    with open('/results/trained_model.pkl', 'wb') as f:
+    # Save trained model - FIX: Use relative path instead of absolute
+    results_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'results')
+    os.makedirs(results_dir, exist_ok=True)
+    model_path = os.path.join(results_dir, 'trained_model.pkl')
+    
+    with open(model_path, 'wb') as f:
         pickle.dump(model, f)
-    print("✅ Model saved to /results/trained_model.pkl")
+    print(f"✅ Model saved to {model_path}")
 
     return model, epoch_losses
 

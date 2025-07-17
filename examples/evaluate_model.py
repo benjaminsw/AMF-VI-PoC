@@ -71,8 +71,10 @@ def comprehensive_evaluation():
     
     print("Loading pre-trained model...")
     
-    # Load pre-trained model
-    model_path = '/content/results/trained_model.pkl'
+    # Load pre-trained model - FIX: Use relative path
+    results_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'results')
+    model_path = os.path.join(results_dir, 'trained_model.pkl')
+    
     if not os.path.exists(model_path):
         print(f"Model file not found at {model_path}")
         print("Please run the training script first: python examples/demo_2d_multimodal.py")
@@ -142,16 +144,16 @@ def comprehensive_evaluation():
     
     plt.tight_layout()
     
-    # Create results directory if it doesn't exist
-    os.makedirs('/results', exist_ok=True)
-    plt.savefig('/results/evaluation_plots.png', dpi=300, bbox_inches='tight')
+    # Create results directory if it doesn't exist - FIX: Use relative path
+    os.makedirs(results_dir, exist_ok=True)
+    plt.savefig(os.path.join(results_dir, 'evaluation_plots.png'), dpi=300, bbox_inches='tight')
     plt.show()
     
     # Save results to file
-    os.makedirs('/results', exist_ok=True)
+    os.makedirs(results_dir, exist_ok=True)
     
     # Save metrics to text file
-    with open('/results/evaluation_results.txt', 'w') as f:
+    with open(os.path.join(results_dir, 'evaluation_results.txt'), 'w') as f:
         f.write("Evaluation Results\n")
         f.write("==================\n")
         f.write(f"Coverage: {coverage:.6f}\n")
@@ -166,7 +168,7 @@ def comprehensive_evaluation():
                    f"Std: [{std[0]:.2f}, {std[1]:.2f}]\n")
     
     # Save metrics to CSV
-    with open('/content/results/metrics.csv', 'w', newline='') as f:
+    with open(os.path.join(results_dir, 'metrics.csv'), 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['metric', 'value'])
         writer.writerow(['coverage', coverage])
@@ -174,9 +176,9 @@ def comprehensive_evaluation():
         writer.writerow(['log_probability', log_prob])
         writer.writerow(['flow_separation', diversity_metrics['avg_separation']])
     
-    print(f"\nResults saved to /results/evaluation_results.txt")
-    print(f"Metrics saved to /results/metrics.csv")
-    print(f"Plots saved to /results/evaluation_plots.png")
+    print(f"\nResults saved to {os.path.join(results_dir, 'evaluation_results.txt')}")
+    print(f"Metrics saved to {os.path.join(results_dir, 'metrics.csv')}")
+    print(f"Plots saved to {os.path.join(results_dir, 'evaluation_plots.png')}")
     
     return {
         'coverage': coverage,
