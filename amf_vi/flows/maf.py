@@ -1,0 +1,140 @@
+import torch
+import torch.nn as nn
+from typing import Tuple
+from .base_flow import BaseFlow
+
+class MaskedLinear(nn.Module):
+    """Masked linear layer for autoregressive flows."""
+    
+    def __init__(self, in_features, out_features, mask):
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features)
+        self.register_buffer('mask', mask)
+    
+    def forward(self, x):
+        return self.linear(x) * self.mask
+
+class MADE(nn.Module):
+    """Masked Autoencoder for Distribution Estimation."""
+    
+    def __init__(self, input_dim, hidden_dim=64, output_dim=None):
+        super().__init__()
+        if output_dim is None:
+            output_dim = input_dim * 2  # For scale and translation
+        
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        
+        # Create connectivity patterns for autoregressive property
+        # Each input i can only depend on inputs 0, 1, ..., i-1
+        
+        # Input to hidden connectivity
+        input_to_hidden = torch.zeros(hidden_dim, input_dim)
+        # Assign each hidden unit to a specific input index
+        hidden_assignment = torch.randint(0, input_dim - 1, (hidden_dim,))
+        for h in range(hidden_dim):
+            # Hidden unit h can connect to inputs 0 through hidden_assignment[h]
+            input_to_hidden[h, :hidden_assignment[h] + 1] = 1
+        
+        # Hidden to output connectivity  
+        hidden_to_output = torch.zeros(output_dim, hidden_dim)
+        for i in range(input_dim):
+            # Output for dimension i (scale and translation)
+            scale_idx = i
+            trans_idx = i + input_dim
+            
+            if scale_idx < output_dim and trans_idx < output_dim:
+                # Can only connect to hidden units assigned to indices < i
+                for h in range(hidden_dim):
+                    if hidden_assignment[h] < i:
+                        hidden_to_output[scale_idx, h] = 1
+                        hidden_to_output[trans_idx, h] = 1
+        
+        # Create masked layers
+        self.input_layer = MaskedLinear(input_dim, hidden_dim, input_to_hidden.t())
+        self.hidden_layer = nn.Linear(hidden_dim, hidden_dim)
+        self.output_layer = MaskedLinear(hidden_dim, output_dim, hidden_to_output.t())
+        
+        self.activation = nn.ReLU()
+        
+        # Store assignments for debugging
+        self.register_buffer('hidden_assignment', hidden_assignment)
+    
+    def forward(self, x):
+        h = self.activation(self.input_layer(x))
+        h = self.activation(self.hidden_layer(h))
+        return self.output_layer(h)
+
+class MAFFlow(BaseFlow):
+    """Masked Autoregressive Flow."""
+    
+    def __init__(self, dim: int, n_layers: int = 4, hidden_dim: int = 64):
+        super().__init__(dim)
+        self.n_layers = n_layers
+        
+        # Create MADE networks for each layer
+        self.made_networks = nn.ModuleList([
+            MADE(dim, hidden_dim) for _ in range(n_layers)
+        ])
+        
+        # Create random permutations for each layer to increase expressiveness
+        self.permutations = []
+        for i in range(n_layers):
+            if i == 0:
+                # Identity permutation for first layer
+                perm = torch.arange(dim)
+            else:
+                # Random permutations for subsequent layers
+                perm = torch.randperm(dim)
+            self.register_buffer(f'perm_{i}', perm)
+            self.permutations.append(perm)
+    
+    def forward_and_log_det(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        z = x.clone()
+        log_det_total = torch.zeros(x.size(0), device=x.device)
+        
+        for i in range(self.n_layers):
+            # Apply permutation to increase expressiveness
+            z = z[:, self.permutations[i]]
+            
+            # Get scale and translation from MADE
+            made_output = self.made_networks[i](z)
+            
+            # Split output into scale and translation
+            scale = made_output[:, :self.dim]
+            translation = made_output[:, self.dim:]
+            
+            # Clamp scale to prevent numerical instability
+            scale = torch.clamp(scale, min=-5, max=5)
+            
+            # Apply autoregressive transformation
+            # Only transform dimensions 1 through dim-1 (keep first dimension unchanged)
+            for j in range(1, self.dim):
+                z[:, j] = z[:, j] * torch.exp(scale[:, j]) + translation[:, j]
+                log_det_total += scale[:, j]
+        
+        return z, log_det_total
+    
+    def inverse(self, z: torch.Tensor) -> torch.Tensor:
+        x = z.clone()
+        
+        # Apply inverse transformations in reverse order
+        for i in reversed(range(self.n_layers)):
+            # Get scale and translation using current x values
+            made_output = self.made_networks[i](x)
+            scale = made_output[:, :self.dim]
+            translation = made_output[:, self.dim:]
+            
+            # Clamp scale
+            scale = torch.clamp(scale, min=-5, max=5)
+            
+            # Apply inverse transformation in reverse dimension order
+            for j in reversed(range(1, self.dim)):
+                x[:, j] = (x[:, j] - translation[:, j]) * torch.exp(-scale[:, j])
+            
+            # Apply inverse permutation
+            inv_perm = torch.argsort(self.permutations[i])
+            x = x[:, inv_perm]
+        
+        return x
