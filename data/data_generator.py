@@ -34,7 +34,7 @@ def create_x_shape_data(n_samples=1000, noise=0.1):
     return torch.tensor(data, dtype=torch.float32)
 
 
-def create_bimodal_shared_base(n_samples=1000, separation=4.0, noise=0.3):
+def create_bimodal_shared_base(n_samples=1000, separation=3.0, noise=0.3):
     """Bimodal with shared covariance"""
     n_half = n_samples // 2
     cov = np.array([[0.5, 0.0], [0.0, 0.5]])
@@ -49,7 +49,7 @@ def create_bimodal_shared_base(n_samples=1000, separation=4.0, noise=0.3):
     return torch.tensor(data, dtype=torch.float32)
 
 
-def create_bimodal_different_base(n_samples=1000, separation=3.0, noise=0.2):
+def create_bimodal_different_base(n_samples=1000, separation=4.5, noise=0.2):
     """Bimodal with different covariances"""
     n_half = n_samples // 2
     cov1 = np.array([[0.8, 0.2], [0.2, 0.3]])
