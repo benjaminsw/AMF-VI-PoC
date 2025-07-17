@@ -11,7 +11,7 @@ import os
 import pickle
 
 class SequentialAMFVI(nn.Module):
-    """Sequential training version of AMF-VI for experimental comparison."""
+    """Sequential training version of AMF-VI with uniform weights."""
     
     def __init__(self, dim=2, flow_types=None):
         super().__init__()
@@ -24,21 +24,11 @@ class SequentialAMFVI(nn.Module):
         self.flows = nn.ModuleList()
         for flow_type in flow_types:
             if flow_type == 'realnvp':
-                self.flows.append(RealNVPFlow(dim, n_layers=4))
+                self.flows.append(RealNVPFlow(dim, n_layers=8))
             elif flow_type == 'planar':
-                self.flows.append(PlanarFlow(dim, n_layers=4))
+                self.flows.append(PlanarFlow(dim, n_layers=8))
             elif flow_type == 'radial':
-                self.flows.append(RadialFlow(dim, n_layers=4))
-        
-        # Meta-learner (posterior prediction network)
-        self.meta_learner = nn.Sequential(
-            nn.Linear(dim + len(self.flows), 64),  # input + flow predictions
-            nn.ReLU(),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, len(self.flows)),
-            nn.Softmax(dim=1)
-        )
+                self.flows.append(RadialFlow(dim, n_layers=8))
         
         # Track if flows are trained
         self.flows_trained = False
@@ -48,7 +38,6 @@ class SequentialAMFVI(nn.Module):
         print("🔄 Stage 1: Training flows independently...")
         
         flow_losses = []
-        device = data.device
         
         for i, flow in enumerate(self.flows):
             print(f"  Training flow {i+1}/{len(self.flows)}: {flow.__class__.__name__}")
@@ -92,66 +81,30 @@ class SequentialAMFVI(nn.Module):
         
         return torch.cat(flow_log_probs, dim=1)  # [batch, n_flows]
     
-    def train_meta_learner(self, data, epochs=300, lr=1e-3):
-        """Stage 2: Train meta-learner to combine flows."""
-        print("🔄 Stage 2: Training meta-learner...")
-        
-        if not self.flows_trained:
-            raise RuntimeError("Flows must be trained first!")
-        
-        # Get flow predictions (fixed)
-        flow_predictions = self.get_flow_predictions(data)
-        
-        # Create input for meta-learner: [x, flow_predictions]
-        meta_input = torch.cat([data, flow_predictions], dim=1)
-        
-        # Train meta-learner
-        optimizer = optim.Adam(self.meta_learner.parameters(), lr=lr)
-        losses = []
-        
-        for epoch in range(epochs):
-            optimizer.zero_grad()
-            
-            # Get adaptive weights from meta-learner
-            weights = self.meta_learner(meta_input)
-            
-            # Compute weighted mixture log probability
-            weighted_log_probs = flow_predictions + torch.log(weights + 1e-8)
-            mixture_log_prob = torch.logsumexp(weighted_log_probs, dim=1)
-            
-            # Meta-learner loss (negative log-likelihood)
-            loss = -mixture_log_prob.mean()
-            
-            loss.backward()
-            optimizer.step()
-            
-            losses.append(loss.item())
-            
-            if epoch % 50 == 0:
-                print(f"  Epoch {epoch}: Loss = {loss.item():.4f}")
-        
-        print(f"  Final loss: {losses[-1]:.4f}")
-        return losses
-    
     def forward(self, x):
-        """Forward pass through the sequential model."""
+        """Forward pass with uniform weights."""
         if not self.flows_trained:
             raise RuntimeError("Model must be trained first!")
         
         # Get flow predictions
         flow_predictions = self.get_flow_predictions(x)
         
-        # Get meta-learner weights
-        meta_input = torch.cat([x, flow_predictions], dim=1)
-        weights = self.meta_learner(meta_input)
+        # Use uniform weights
+        batch_size = x.size(0)
+        weights = torch.ones(batch_size, len(self.flows), device=x.device) / len(self.flows)
+        
+        # Compute mixture log probability
+        weighted_log_probs = flow_predictions + torch.log(weights + 1e-8)
+        mixture_log_prob = torch.logsumexp(weighted_log_probs, dim=1)
         
         return {
             'log_prob': flow_predictions,
             'weights': weights,
+            'mixture_log_prob': mixture_log_prob,
         }
     
     def sample(self, n_samples):
-        """Sample from the mixture (uniform weights for simplicity)."""
+        """Sample from the mixture with uniform weights."""
         device = next(self.parameters()).device
         
         # Sample uniformly from flows
@@ -174,7 +127,7 @@ class SequentialAMFVI(nn.Module):
         return torch.cat(all_samples, dim=0)
 
 def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plots=False):
-    """Train sequential AMF-VI and compare with current approach."""
+    """Train sequential AMF-VI with uniform weights."""
     
     print(f"🚀 Sequential AMF-VI Experiment on {dataset_name}")
     print("=" * 60)
@@ -190,9 +143,6 @@ def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plo
     
     # Stage 1: Train flows independently
     flow_losses = model.train_flows_independently(data, epochs=200, lr=1e-3)
-    
-    # Stage 2: Train meta-learner
-    meta_losses = model.train_meta_learner(data, epochs=300, lr=1e-3)
     
     # Evaluation and visualization
     print("\n🎨 Generating visualizations...")
@@ -234,9 +184,12 @@ def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plo
                 axes[row, col].set_title(f'{name.title()} Flow')
                 axes[row, col].grid(True, alpha=0.3)
         
-        # Plot training losses
-        axes[1, 2].plot(meta_losses, label='Meta-learner', color='red', linewidth=2)
-        axes[1, 2].set_title('Meta-learner Training Loss')
+        # Plot training losses (flow losses only)
+        if flow_losses:
+            axes[1, 2].plot(flow_losses[0], label='Flow 1', color='green', linewidth=2, alpha=0.7)
+            axes[1, 2].plot(flow_losses[1], label='Flow 2', color='orange', linewidth=2, alpha=0.7)
+            axes[1, 2].plot(flow_losses[2], label='Flow 3', color='purple', linewidth=2, alpha=0.7)
+        axes[1, 2].set_title('Individual Flow Training Losses')
         axes[1, 2].set_xlabel('Epoch')
         axes[1, 2].set_ylabel('Loss')
         axes[1, 2].grid(True, alpha=0.3)
@@ -279,10 +232,10 @@ def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plo
     model_path = os.path.join(results_dir, f'trained_model_{dataset_name}.pkl')
     
     with open(model_path, 'wb') as f:
-        pickle.dump({'model': model, 'losses': meta_losses, 'dataset': dataset_name}, f)
+        pickle.dump({'model': model, 'losses': flow_losses, 'dataset': dataset_name}, f)
     print(f"✅ Model saved to {model_path}")
     
-    return model, flow_losses, meta_losses
+    return model, flow_losses
 
 if __name__ == "__main__":
     # Run the sequential AMF-VI experiment on multiple datasets
@@ -293,7 +246,7 @@ if __name__ == "__main__":
         print(f"Training on dataset: {dataset_name.upper()}")
         print(f"{'='*60}")
         
-        model, flow_losses, meta_losses = train_sequential_amf_vi(
+        model, flow_losses = train_sequential_amf_vi(
             dataset_name, 
             show_plots=False, 
             save_plots=True

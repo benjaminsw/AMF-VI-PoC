@@ -212,7 +212,8 @@ def comprehensive_evaluation():
     os.makedirs(results_dir, exist_ok=True)
     plt.savefig(os.path.join(results_dir, 'sequential_comprehensive_evaluation.png'), 
                 dpi=300, bbox_inches='tight')
-    plt.show()
+    plt.close(fig)  # turn off the plot
+    # plt.show()  # Comment out or remove this
     
     # Create summary table
     print(f"\n{'='*80}")
