@@ -9,10 +9,15 @@ class MaskedLinear(nn.Module):
     def __init__(self, in_features, out_features, mask):
         super().__init__()
         self.linear = nn.Linear(in_features, out_features)
+        # Ensure mask has correct shape: [out_features, in_features]
+        if mask.dim() == 1:
+            mask = mask.unsqueeze(0).expand(out_features, -1)
         self.register_buffer('mask', mask)
     
     def forward(self, x):
-        return self.linear(x) * self.mask
+        # Apply mask to weights during forward pass
+        masked_weight = self.linear.weight * self.mask
+        return nn.functional.linear(x, masked_weight, self.linear.bias)
 
 class MADE(nn.Module):
     """Masked Autoencoder for Distribution Estimation."""
@@ -26,40 +31,41 @@ class MADE(nn.Module):
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
         
-        # Create connectivity patterns for autoregressive property
-        # Each input i can only depend on inputs 0, 1, ..., i-1
+        # Simplified autoregressive masking
+        # Each dimension can only depend on previous dimensions
         
-        # Input to hidden connectivity
-        input_to_hidden = torch.zeros(hidden_dim, input_dim)
-        # Assign each hidden unit to a specific input index
-        hidden_assignment = torch.randint(0, input_dim - 1, (hidden_dim,))
+        # Input to hidden: each hidden unit sees up to a certain input dimension
+        max_degree = input_dim - 1
+        degrees = torch.randint(0, max_degree, (hidden_dim,))
+        
+        # Input mask: hidden unit h can see inputs 0 to degrees[h]
+        input_mask = torch.zeros(hidden_dim, input_dim)
         for h in range(hidden_dim):
-            # Hidden unit h can connect to inputs 0 through hidden_assignment[h]
-            input_to_hidden[h, :hidden_assignment[h] + 1] = 1
+            input_mask[h, :degrees[h]+1] = 1
         
-        # Hidden to output connectivity  
-        hidden_to_output = torch.zeros(output_dim, hidden_dim)
-        for i in range(input_dim):
-            # Output for dimension i (scale and translation)
-            scale_idx = i
-            trans_idx = i + input_dim
+        # Output mask: output for dimension d can only use hidden units with degree < d
+        output_mask = torch.zeros(output_dim, hidden_dim)
+        for d in range(input_dim):
+            # Scale and translation for dimension d
+            scale_idx = d
+            trans_idx = d + input_dim
             
-            if scale_idx < output_dim and trans_idx < output_dim:
-                # Can only connect to hidden units assigned to indices < i
-                for h in range(hidden_dim):
-                    if hidden_assignment[h] < i:
-                        hidden_to_output[scale_idx, h] = 1
-                        hidden_to_output[trans_idx, h] = 1
+            for h in range(hidden_dim):
+                if degrees[h] < d:
+                    if scale_idx < output_dim:
+                        output_mask[scale_idx, h] = 1
+                    if trans_idx < output_dim:
+                        output_mask[trans_idx, h] = 1
         
         # Create masked layers
-        self.input_layer = MaskedLinear(input_dim, hidden_dim, input_to_hidden.t())
+        self.input_layer = MaskedLinear(input_dim, hidden_dim, input_mask)
         self.hidden_layer = nn.Linear(hidden_dim, hidden_dim)
-        self.output_layer = MaskedLinear(hidden_dim, output_dim, hidden_to_output.t())
+        self.output_layer = MaskedLinear(hidden_dim, output_dim, output_mask)
         
         self.activation = nn.ReLU()
         
-        # Store assignments for debugging
-        self.register_buffer('hidden_assignment', hidden_assignment)
+        # Store degrees for debugging
+        self.register_buffer('degrees', degrees)
     
     def forward(self, x):
         h = self.activation(self.input_layer(x))
