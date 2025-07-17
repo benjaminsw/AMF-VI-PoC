@@ -28,6 +28,7 @@ class RealNVPFlow(BaseFlow):
         self.masks = []
         for i in range(n_layers):
             mask = torch.zeros(dim)
+            #mask[0] = 1  # Always keep x1, transform x2
             mask[i % 2::2] = 1  # Alternate between even/odd indices
             self.register_buffer(f'mask_{i}', mask)
             self.masks.append(mask)

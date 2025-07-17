@@ -26,14 +26,14 @@ class SequentialAMFVI(nn.Module):
             if flow_type == 'realnvp':
                 self.flows.append(RealNVPFlow(dim, n_layers=8))
             elif flow_type == 'planar':
-                self.flows.append(PlanarFlow(dim, n_layers=8))
+                self.flows.append(PlanarFlow(dim, n_layers=32))
             elif flow_type == 'radial':
-                self.flows.append(RadialFlow(dim, n_layers=8))
+                self.flows.append(RadialFlow(dim, n_layers=32))
         
         # Track if flows are trained
         self.flows_trained = False
     
-    def train_flows_independently(self, data, epochs=200, lr=1e-3):
+    def train_flows_independently(self, data, epochs=1000, lr=1e-4):
         """Stage 1: Train each flow independently."""
         print("🔄 Stage 1: Training flows independently...")
         

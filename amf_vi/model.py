@@ -4,9 +4,14 @@ from typing import List, Dict, Any
 from .flows.realnvp import RealNVPFlow
 from .flows.planar import PlanarFlow
 from .flows.radial import RadialFlow
+from .flows.nice import NICEFlow
+from .flows.glow import GlowFlow
 
 class SimpleAMFVI(nn.Module):
-    """Simplified AMF-VI model for PoC."""
+    """
+    Simplified AMF-VI model for PoC with support for multiple flow types.
+    Now includes NICE and Glow flows in addition to RealNVP, Planar, and Radial.
+    """
     
     def __init__(self, dim: int = 2, flow_types: List[str] = None, n_components: int = 3):
         super().__init__()
@@ -14,7 +19,13 @@ class SimpleAMFVI(nn.Module):
         self.n_components = n_components
         
         if flow_types is None:
-            flow_types = ['realnvp', 'planar', 'radial']
+            flow_types = ['realnvp', 'planar', 'radial', 'nice', 'glow']
+        
+        # Validate flow types
+        valid_flows = ['realnvp', 'planar', 'radial', 'nice', 'glow']
+        for flow_type in flow_types:
+            if flow_type not in valid_flows:
+                raise ValueError(f"Unknown flow type: {flow_type}. Valid types: {valid_flows}")
         
         # Create different flow types
         self.flows = nn.ModuleList()
@@ -25,8 +36,13 @@ class SimpleAMFVI(nn.Module):
                 self.flows.append(PlanarFlow(dim, n_layers=8))
             elif flow_type == 'radial':
                 self.flows.append(RadialFlow(dim, n_layers=8))
-            else:
-                raise ValueError(f"Unknown flow type: {flow_type}")
+            elif flow_type == 'nice':
+                self.flows.append(NICEFlow(dim, n_layers=4))
+            elif flow_type == 'glow':
+                self.flows.append(GlowFlow(dim, n_steps=4))
+        
+        # Store flow types for reference
+        self.flow_types = flow_types[:n_components]
         
         # Simple gating network (mixture weights)
         self.gating_net = nn.Sequential(
@@ -113,3 +129,19 @@ class SimpleAMFVI(nn.Module):
                 total_loss += torch.exp(-dist)  # Penalize close means
         
         return self.reg_weight * total_loss
+    
+    def get_flow_info(self) -> Dict[str, Any]:
+        """Get information about the flows in the model."""
+        return {
+            'n_flows': len(self.flows),
+            'flow_types': self.flow_types,
+            'dim': self.dim,
+            'flow_details': [
+                {
+                    'type': flow_type,
+                    'class': flow.__class__.__name__,
+                    'n_parameters': sum(p.numel() for p in flow.parameters()),
+                }
+                for flow_type, flow in zip(self.flow_types, self.flows)
+            ]
+        }
