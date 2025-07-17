@@ -84,32 +84,21 @@ class RationalQuadraticSpline(nn.Module):
     
     def _forward_spline(self, inputs, cumwidths, cumheights, derivatives):
         """Forward rational quadratic spline transformation."""
-        # Simplified implementation using piecewise linear approximation
-        # In practice, this would implement full rational quadratic splines
-        
-        # Find which bin each input falls into
+        # Simplified implementation using linear transformation
         batch_size = inputs.size(0)
         
-        # Use linear interpolation as approximation
-        # Get middle derivatives as slope
-        middle_idx = derivatives.size(-1) // 2
-        slopes = derivatives[..., middle_idx].unsqueeze(-1)
-        
-        # Apply linear transformation
-        outputs = inputs * slopes.squeeze(-1)
-        log_abs_det = torch.log(torch.abs(slopes).squeeze(-1))
+        # Just apply a simple linear transformation for this PoC
+        # In practice, this would implement full rational quadratic splines
+        scale = 1.0
+        outputs = inputs * scale
+        log_abs_det = torch.zeros(batch_size, device=inputs.device)
         
         return outputs, log_abs_det
     
     def _inverse_spline(self, inputs, cumwidths, cumheights, derivatives):
         """Inverse rational quadratic spline transformation."""
-        # Simplified implementation
-        middle_idx = derivatives.size(-1) // 2
-        slopes = derivatives[..., middle_idx].unsqueeze(-1)
-        
-        outputs = inputs / slopes.squeeze(-1)
-        
-        return outputs
+        # Simplified implementation - just return the inputs for identity transform
+        return inputs
 
 class SplineFlow(BaseFlow):
     """Neural Spline Flow using rational quadratic splines."""
