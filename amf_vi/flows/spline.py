@@ -164,19 +164,25 @@ class SplineFlow(BaseFlow):
         for i in range(self.n_layers):
             mask = self.masks[i].to(x.device)
             
-            # Split into conditioner and target
-            x_conditioner = z * mask
-            x_target = z * (1 - mask)
+            # Split into conditioner and target using proper indexing
+            # Use broadcasting to select elements properly
+            mask_expanded = mask.unsqueeze(0).expand_as(z)
+            x_conditioner = z * mask_expanded
+            x_target = z * (1 - mask_expanded)
             
-            # Generate spline parameters from conditioner
-            conditioner_input = x_conditioner[mask.bool()].view(z.size(0), -1)
-            spline_params = self.transforms[i](conditioner_input)
+            # Extract conditioner values (non-zero elements)
+            conditioner_indices = mask.bool()
+            target_indices = ~mask.bool()
             
-            # Apply spline to target
-            target_input = x_target[(1 - mask).bool()].view(z.size(0), -1)
+            # Get conditioner input by selecting columns
+            conditioner_input = z[:, conditioner_indices]
+            target_input = z[:, target_indices]
             
-            if target_input.numel() > 0:
-                # Reshape spline_params for each target dimension
+            if conditioner_input.numel() > 0 and target_input.numel() > 0:
+                # Generate spline parameters from conditioner
+                spline_params = self.transforms[i](conditioner_input)
+                
+                # Apply spline to target
                 n_target = target_input.size(1)
                 params_per_dim = spline_params.size(-1) // n_target
                 
@@ -196,8 +202,8 @@ class SplineFlow(BaseFlow):
                     log_det_total += log_det_dim
                 
                 # Reconstruct z
-                z_new = x_conditioner.clone()
-                z_new[(1 - mask).bool()] = transformed_target.flatten()
+                z_new = z.clone()
+                z_new[:, target_indices] = transformed_target
                 z = z_new
         
         return z, log_det_total
@@ -209,17 +215,18 @@ class SplineFlow(BaseFlow):
         for i in reversed(range(self.n_layers)):
             mask = self.masks[i].to(z.device)
             
-            x_conditioner = x * mask
-            x_target = x * (1 - mask)
+            # Split using proper indexing
+            conditioner_indices = mask.bool()
+            target_indices = ~mask.bool()
             
-            # Generate spline parameters from conditioner
-            conditioner_input = x_conditioner[mask.bool()].view(x.size(0), -1)
-            spline_params = self.transforms[i](conditioner_input)
+            conditioner_input = x[:, conditioner_indices]
+            target_input = x[:, target_indices]
             
-            # Apply inverse spline to target
-            target_input = x_target[(1 - mask).bool()].view(x.size(0), -1)
-            
-            if target_input.numel() > 0:
+            if conditioner_input.numel() > 0 and target_input.numel() > 0:
+                # Generate spline parameters from conditioner
+                spline_params = self.transforms[i](conditioner_input)
+                
+                # Apply inverse spline to target
                 n_target = target_input.size(1)
                 params_per_dim = spline_params.size(-1) // n_target
                 
@@ -237,8 +244,8 @@ class SplineFlow(BaseFlow):
                     transformed_target[:, j:j+1] = transformed_dim
                 
                 # Reconstruct x
-                x_new = x_conditioner.clone()
-                x_new[(1 - mask).bool()] = transformed_target.flatten()
+                x_new = x.clone()
+                x_new[:, target_indices] = transformed_target
                 x = x_new
         
         return x

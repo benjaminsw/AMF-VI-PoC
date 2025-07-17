@@ -114,11 +114,13 @@ class MAFFlow(BaseFlow):
             # Clamp scale to prevent numerical instability
             scale = torch.clamp(scale, min=-5, max=5)
             
-            # Apply autoregressive transformation
-            # Only transform dimensions 1 through dim-1 (keep first dimension unchanged)
+            # Apply autoregressive transformation without in-place operations
+            # Create a new tensor to avoid in-place modifications
+            z_new = z.clone()
             for j in range(1, self.dim):
-                z[:, j] = z[:, j] * torch.exp(scale[:, j]) + translation[:, j]
+                z_new[:, j] = z[:, j] * torch.exp(scale[:, j]) + translation[:, j]
                 log_det_total += scale[:, j]
+            z = z_new
         
         return z, log_det_total
     
@@ -136,8 +138,11 @@ class MAFFlow(BaseFlow):
             scale = torch.clamp(scale, min=-5, max=5)
             
             # Apply inverse transformation in reverse dimension order
+            # Create new tensor to avoid in-place operations
+            x_new = x.clone()
             for j in reversed(range(1, self.dim)):
-                x[:, j] = (x[:, j] - translation[:, j]) * torch.exp(-scale[:, j])
+                x_new[:, j] = (x[:, j] - translation[:, j]) * torch.exp(-scale[:, j])
+            x = x_new
             
             # Apply inverse permutation
             inv_perm = torch.argsort(self.permutations[i])
