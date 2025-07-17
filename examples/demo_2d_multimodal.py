@@ -16,6 +16,7 @@ from amf_vi.utils import (
 )
 import pickle
 import os
+from data.data_generator import generate_data
 
 def check_for_nan(tensor, name="tensor"):
     """Diagnostic function to check for NaN values."""
@@ -38,8 +39,8 @@ def train_amf_vi(show_plots=True, save_plots=False):
     print("🚀 Starting AMF-VI training on 2D multimodal data...")
     
     # Create data
-    data = create_multimodal_data(2000)
-    print(f"📊 Data stats - Min: {data.min():.3f}, Max: {data.max():.3f}, Mean: {data.mean():.3f}")
+    data = generate_data('banana', n_samples=2000)
+    #data = generate_data('x_shape', n_samples=1500, noise=0.15)
     
     # Create model with different flow types
     model = SimpleAMFVI(
@@ -60,7 +61,7 @@ def train_amf_vi(show_plots=True, save_plots=False):
     # Add scheduler
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=200, gamma=0.7)
     
-    loss_fn = SimpleIWAELoss(n_importance_samples=5)
+    loss_fn = SimpleIWAELoss(n_importance_samples=10) #5
     
     # Training loop with loss tracking
     n_epochs = 500

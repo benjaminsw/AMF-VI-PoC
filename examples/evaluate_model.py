@@ -8,6 +8,7 @@ from amf_vi.utils import create_multimodal_data, plot_samples
 import os
 import pickle
 import csv
+from data.data_generator import generate_data, get_available_datasets
 
 def compute_coverage(target_samples, generated_samples, threshold=0.1):
     """Compute mode coverage metric."""
@@ -67,7 +68,7 @@ def comprehensive_evaluation():
     """Comprehensive evaluation of trained AMF-VI model."""
     
     # Create test data
-    test_data = create_multimodal_data(2000)
+    test_data = generate_data('banana', n_samples=2000)
     
     print("Loading pre-trained model...")
     
