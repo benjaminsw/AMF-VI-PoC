@@ -7,6 +7,8 @@ from amf_vi.flows.planar import PlanarFlow
 from amf_vi.flows.radial import RadialFlow
 from data.data_generator import generate_data
 import numpy as np
+import os
+import pickle
 
 class SequentialAMFVI(nn.Module):
     """Sequential training version of AMF-VI for experimental comparison."""
@@ -22,7 +24,7 @@ class SequentialAMFVI(nn.Module):
         self.flows = nn.ModuleList()
         for flow_type in flow_types:
             if flow_type == 'realnvp':
-                self.flows.append(RealNVPFlow(dim, n_layers=4))
+                self.flows.append(RealNVPFlow(dim, n_layers=8))
             elif flow_type == 'planar':
                 self.flows.append(PlanarFlow(dim, n_layers=8))
             elif flow_type == 'radial':
@@ -171,7 +173,7 @@ class SequentialAMFVI(nn.Module):
         
         return torch.cat(all_samples, dim=0)
 
-def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True):
+def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plots=False):
     """Train sequential AMF-VI and compare with current approach."""
     
     print(f"🚀 Sequential AMF-VI Experiment on {dataset_name}")
@@ -193,91 +195,106 @@ def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True):
     meta_losses = model.train_meta_learner(data, epochs=300, lr=1e-3)
     
     # Evaluation and visualization
-    if show_plots:
-        print("\n🎨 Generating visualizations...")
+    print("\n🎨 Generating visualizations...")
+    
+    model.eval()
+    with torch.no_grad():
+        # Generate samples
+        model_samples = model.sample(1000)
         
-        model.eval()
-        with torch.no_grad():
-            # Generate samples
-            model_samples = model.sample(1000)
-            
-            # Individual flow samples
-            flow_samples = {}
-            flow_names = ['realnvp', 'planar', 'radial']
-            for i, name in enumerate(flow_names):
-                flow_samples[name] = model.flows[i].sample(1000)
-            
-            # Create visualization
-            fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-            
-            # Plot target data
-            data_np = data.cpu().numpy()
-            axes[0, 0].scatter(data_np[:, 0], data_np[:, 1], alpha=0.6, c='blue', s=20)
-            axes[0, 0].set_title('Target Data')
-            axes[0, 0].grid(True, alpha=0.3)
-            
-            # Plot sequential model samples
-            model_np = model_samples.cpu().numpy()
-            axes[0, 1].scatter(model_np[:, 0], model_np[:, 1], alpha=0.6, c='red', s=20)
-            axes[0, 1].set_title('Sequential AMF-VI Samples')
-            axes[0, 1].grid(True, alpha=0.3)
-            
-            # Plot individual flows
-            colors = ['green', 'orange', 'purple']
-            for i, (name, samples) in enumerate(flow_samples.items()):
-                if i < 3:
-                    row, col = (0, 2) if i == 0 else (1, i-1)
-                    samples_np = samples.cpu().numpy()
-                    axes[row, col].scatter(samples_np[:, 0], samples_np[:, 1], 
-                                         alpha=0.6, c=colors[i], s=20)
-                    axes[row, col].set_title(f'{name.title()} Flow')
-                    axes[row, col].grid(True, alpha=0.3)
-            
-            # Plot training losses
-            axes[1, 2].plot(meta_losses, label='Meta-learner', color='red', linewidth=2)
-            axes[1, 2].set_title('Meta-learner Training Loss')
-            axes[1, 2].set_xlabel('Epoch')
-            axes[1, 2].set_ylabel('Loss')
-            axes[1, 2].grid(True, alpha=0.3)
-            axes[1, 2].legend()
-            
-            plt.tight_layout()
-            plt.suptitle(f'Sequential AMF-VI Results - {dataset_name.title()}', fontsize=16)
+        # Individual flow samples
+        flow_samples = {}
+        flow_names = ['realnvp', 'planar', 'radial']
+        for i, name in enumerate(flow_names):
+            flow_samples[name] = model.flows[i].sample(1000)
+        
+        # Create visualization
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        
+        # Plot target data
+        data_np = data.cpu().numpy()
+        axes[0, 0].scatter(data_np[:, 0], data_np[:, 1], alpha=0.6, c='blue', s=20)
+        axes[0, 0].set_title('Target Data')
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        # Plot sequential model samples
+        model_np = model_samples.cpu().numpy()
+        axes[0, 1].scatter(model_np[:, 0], model_np[:, 1], alpha=0.6, c='red', s=20)
+        axes[0, 1].set_title('Sequential AMF-VI Samples')
+        axes[0, 1].grid(True, alpha=0.3)
+        
+        # Plot individual flows
+        colors = ['green', 'orange', 'purple']
+        for i, (name, samples) in enumerate(flow_samples.items()):
+            if i < 3:
+                row, col = (0, 2) if i == 0 else (1, i-1)
+                samples_np = samples.cpu().numpy()
+                axes[row, col].scatter(samples_np[:, 0], samples_np[:, 1], 
+                                     alpha=0.6, c=colors[i], s=20)
+                axes[row, col].set_title(f'{name.title()} Flow')
+                axes[row, col].grid(True, alpha=0.3)
+        
+        # Plot training losses
+        axes[1, 2].plot(meta_losses, label='Meta-learner', color='red', linewidth=2)
+        axes[1, 2].set_title('Meta-learner Training Loss')
+        axes[1, 2].set_xlabel('Epoch')
+        axes[1, 2].set_ylabel('Loss')
+        axes[1, 2].grid(True, alpha=0.3)
+        axes[1, 2].legend()
+        
+        plt.tight_layout()
+        plt.suptitle(f'Sequential AMF-VI Results - {dataset_name.title()}', fontsize=16)
+        
+        # Save plot if requested
+        if save_plots:
+            results_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'results')
+            os.makedirs(results_dir, exist_ok=True)
+            plot_path = os.path.join(results_dir, f'sequential_amf_vi_results_{dataset_name}.png')
+            fig.savefig(plot_path, dpi=300, bbox_inches='tight')
+            print(f"✅ Plot saved to {plot_path}")
+        
+        # Show plot if requested
+        if show_plots:
             plt.show()
-            
-            # Print analysis
-            print("\n📊 Analysis:")
-            print(f"Target data mean: {data.mean(dim=0).cpu().numpy()}")
-            print(f"Sequential model mean: {model_samples.mean(dim=0).cpu().numpy()}")
-            print(f"Target data std: {data.std(dim=0).cpu().numpy()}")
-            print(f"Sequential model std: {model_samples.std(dim=0).cpu().numpy()}")
-            
-            # Check flow diversity
-            print("\n🔍 Flow Specialization Analysis:")
-            for i, (name, samples) in enumerate(flow_samples.items()):
-                mean = samples.mean(dim=0).cpu().numpy()
-                std = samples.std(dim=0).cpu().numpy()
-                print(f"{name.capitalize()}: Mean=[{mean[0]:.2f}, {mean[1]:.2f}], Std=[{std[0]:.2f}, {std[1]:.2f}]")
+        else:
+            plt.close(fig)
+        
+        # Print analysis
+        print("\n📊 Analysis:")
+        print(f"Target data mean: {data.mean(dim=0).cpu().numpy()}")
+        print(f"Sequential model mean: {model_samples.mean(dim=0).cpu().numpy()}")
+        print(f"Target data std: {data.std(dim=0).cpu().numpy()}")
+        print(f"Sequential model std: {model_samples.std(dim=0).cpu().numpy()}")
+        
+        # Check flow diversity
+        print("\n🔍 Flow Specialization Analysis:")
+        for i, (name, samples) in enumerate(flow_samples.items()):
+            mean = samples.mean(dim=0).cpu().numpy()
+            std = samples.std(dim=0).cpu().numpy()
+            print(f"{name.capitalize()}: Mean=[{mean[0]:.2f}, {mean[1]:.2f}], Std=[{std[0]:.2f}, {std[1]:.2f}]")
+    
+    # Save trained model
+    results_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'results')
+    os.makedirs(results_dir, exist_ok=True)
+    model_path = os.path.join(results_dir, f'trained_model_{dataset_name}.pkl')
+    
+    with open(model_path, 'wb') as f:
+        pickle.dump({'model': model, 'losses': meta_losses, 'dataset': dataset_name}, f)
+    print(f"✅ Model saved to {model_path}")
     
     return model, flow_losses, meta_losses
 
-def compare_with_current_approach():
-    """Compare sequential vs current approach."""
-    print("🔬 Experimental Comparison: Sequential vs Current AMF-VI")
-    print("=" * 70)
-    
-    # Test sequential approach
-    seq_model, flow_losses, meta_losses = train_sequential_amf_vi('multimodal', show_plots=True)
-    
-    print("\n" + "=" * 70)
-    print("Expected Issues with Sequential Training:")
-    print("1. All flows likely learned similar distributions (mode collapse)")
-    print("2. Meta-learner has to work with redundant flows")
-    print("3. Less effective multimodal coverage")
-    print("4. No adaptive specialization during flow training")
-    
-    return seq_model
-
 if __name__ == "__main__":
-    # Run the experimental comparison
-    model = compare_with_current_approach()
+    # Run the sequential AMF-VI experiment on multiple datasets
+    datasets = ['banana', 'x_shape', 'bimodal_shared', 'bimodal_different']
+    
+    for dataset_name in datasets:
+        print(f"\n{'='*60}")
+        print(f"Training on dataset: {dataset_name.upper()}")
+        print(f"{'='*60}")
+        
+        model, flow_losses, meta_losses = train_sequential_amf_vi(
+            dataset_name, 
+            show_plots=False, 
+            save_plots=True
+        )
