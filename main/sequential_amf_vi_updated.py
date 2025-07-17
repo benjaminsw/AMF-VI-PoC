@@ -19,7 +19,7 @@ class SequentialAMFVI(nn.Module):
         self.dim = dim
         
         if flow_types is None:
-            flow_types = ['realnvp', 'maf', 'spline']
+            flow_types = ['realnvp', 'maf', 'iaf']
         
         # Create flows
         self.flows = nn.ModuleList()
@@ -52,12 +52,27 @@ class SequentialAMFVI(nn.Module):
             for epoch in range(epochs):
                 optimizer.zero_grad()
                 
-                # Individual flow loss (negative log-likelihood)
-                log_prob = flow.log_prob(data)
-                loss = -log_prob.mean()
-                
-                loss.backward()
-                optimizer.step()
+                try:
+                    # Individual flow loss (negative log-likelihood)
+                    log_prob = flow.log_prob(data)
+                    loss = -log_prob.mean()
+                    
+                    # Check if loss requires grad
+                    if loss.requires_grad:
+                        loss.backward()
+                        optimizer.step()
+                    else:
+                        print(f"    Warning: Loss doesn't require grad at epoch {epoch}")
+                    
+                except RuntimeError as e:
+                    if "does not require grad" in str(e):
+                        print(f"    Skipping gradient step at epoch {epoch}: {e}")
+                        # Create a dummy loss for this step
+                        dummy_loss = torch.tensor(float('nan'), requires_grad=True)
+                        losses.append(dummy_loss.item())
+                        continue
+                    else:
+                        raise e
                 
                 losses.append(loss.item())
                 
@@ -141,7 +156,7 @@ def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plo
     data = data.to(device)
     
     # Create sequential model
-    model = SequentialAMFVI(dim=2, flow_types=['realnvp', 'maf', 'spline'])
+    model = SequentialAMFVI(dim=2, flow_types=['realnvp', 'maf', 'iaf'])
     model = model.to(device)
     
     # Stage 1: Train flows independently
@@ -157,7 +172,7 @@ def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plo
         
         # Individual flow samples
         flow_samples = {}
-        flow_names = ['realnvp', 'maf', 'spline']
+        flow_names = ['realnvp', 'maf', 'iaf']
         for i, name in enumerate(flow_names):
             flow_samples[name] = model.flows[i].sample(1000)
         
@@ -191,7 +206,7 @@ def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plo
         if flow_losses:
             axes[1, 2].plot(flow_losses[0], label='Real-NVP', color='green', linewidth=2, alpha=0.7)
             axes[1, 2].plot(flow_losses[1], label='MAF', color='orange', linewidth=2, alpha=0.7)
-            axes[1, 2].plot(flow_losses[2], label='Spline', color='purple', linewidth=2, alpha=0.7)
+            axes[1, 2].plot(flow_losses[2], label='IAF', color='purple', linewidth=2, alpha=0.7)
         axes[1, 2].set_title('Individual Flow Training Losses')
         axes[1, 2].set_xlabel('Epoch')
         axes[1, 2].set_ylabel('Loss')
