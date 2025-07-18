@@ -27,9 +27,9 @@ class SequentialAMFVI(nn.Module):
             if flow_type == 'realnvp':
                 self.flows.append(RealNVPFlow(dim, n_layers=8))
             elif flow_type == 'maf':
-                self.flows.append(MAFFlow(dim, n_layers=6))
+                self.flows.append(MAFFlow(dim, n_layers=14))
             elif flow_type == 'iaf':
-                self.flows.append(IAFFlow(dim, n_layers=6))
+                self.flows.append(IAFFlow(dim, n_layers=14))
             elif flow_type == 'spline':
                 self.flows.append(SplineFlow(dim, n_layers=8))
         
