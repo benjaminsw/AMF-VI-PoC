@@ -97,7 +97,7 @@ class MAFFlow(BaseFlow):
             self.permutations.append(perm)
     
     def forward_and_log_det(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        z = x.clone()
+        z = x.clone()  # FIXED: Start with a copy to avoid modifying input
         log_det_total = torch.zeros(x.size(0), device=x.device)
         
         for i in range(self.n_layers):
@@ -119,13 +119,13 @@ class MAFFlow(BaseFlow):
             z_new = z.clone()
             for j in range(1, self.dim):
                 z_new[:, j] = z[:, j] * torch.exp(scale[:, j]) + translation[:, j]
-                log_det_total += scale[:, j]
+                log_det_total = log_det_total + scale[:, j]  # FIXED: Avoid += in-place operation
             z = z_new
         
         return z, log_det_total
     
     def inverse(self, z: torch.Tensor) -> torch.Tensor:
-        x = z.clone()
+        x = z.clone()  # FIXED: Start with a copy
         
         # Apply inverse transformations in reverse order
         for i in reversed(range(self.n_layers)):

@@ -86,7 +86,7 @@ class IAFFlow(BaseFlow):
         Forward pass: x -> z
         In IAF, this is the expensive direction (sequential computation)
         """
-        z = x.clone()
+        z = x.clone()  # FIXED: Start with a copy to avoid modifying input
         log_det_total = torch.zeros(x.size(0), device=x.device)
         
         for i in range(self.n_layers):
@@ -106,7 +106,8 @@ class IAFFlow(BaseFlow):
                     translation = net_output[:, 1]
                 else:
                     # Use current z values up to dimension j-1
-                    prev_z = z_new[:, :j]
+                    # FIXED: Create a clean copy to avoid inplace operation issues
+                    prev_z = z_new[:, :j].clone().detach()
                     net_output = self.autoregressive_nets[i].networks[j](prev_z)
                     scale = net_output[:, 0]
                     translation = net_output[:, 1]
@@ -116,7 +117,7 @@ class IAFFlow(BaseFlow):
                 
                 # Apply transformation: z_j = x_j * exp(s_j) + t_j
                 z_new[:, j] = z[:, j] * torch.exp(scale) + translation
-                log_det_total += scale
+                log_det_total = log_det_total + scale  # FIXED: Avoid += in-place operation
             
             z = z_new
         
@@ -127,7 +128,7 @@ class IAFFlow(BaseFlow):
         Inverse pass: z -> x  
         In IAF, this is the efficient direction (parallel computation)
         """
-        x = z.clone()
+        x = z.clone()  # FIXED: Start with a copy
         
         # Apply inverse transformations in reverse order
         for i in reversed(range(self.n_layers)):
@@ -148,7 +149,7 @@ class IAFFlow(BaseFlow):
         More efficient inverse implementation that leverages IAF's strength.
         This version can compute all dimensions in parallel.
         """
-        x = z.clone()
+        x = z.clone()  # FIXED: Start with a copy
         
         for i in reversed(range(self.n_layers)):
             # Compute all scales and translations at once
