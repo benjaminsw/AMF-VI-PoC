@@ -4,6 +4,11 @@ import torch.nn.functional as F
 from typing import Tuple
 from .base_flow import BaseFlow
 
+def searchsorted(bin_locations, inputs, eps=1e-6):
+    """Find which bin each input belongs to."""
+    bin_locations[..., -1] += eps
+    return torch.sum(inputs[..., None] >= bin_locations, dim=-1) - 1
+
 class RationalQuadraticSpline(nn.Module):
     """Rational quadratic spline transformation."""
     
@@ -16,60 +21,127 @@ class RationalQuadraticSpline(nn.Module):
         self.min_derivative = 1e-3
     
     def forward(self, inputs, params, inverse=False):
-        """Apply spline transformation."""
+        """Apply rational quadratic spline transformation."""
+        # Ensure inputs is 1D
+        original_shape = inputs.shape
+        inputs = inputs.view(-1)
         batch_size = inputs.size(0)
+        
+        # Parse parameters: widths, heights, derivatives
+        num_bins = self.num_bins
+        # params shape: [batch_size, 3*num_bins + 1]
+        unnormalized_widths = params[..., :num_bins]
+        unnormalized_heights = params[..., num_bins:2*num_bins]
+        unnormalized_derivatives = params[..., 2*num_bins:]
         
         # For inputs outside tail bounds, use linear transformation
         inside_interval_mask = (inputs >= -self.tail_bound) & (inputs <= self.tail_bound)
         outside_interval_mask = ~inside_interval_mask
         
         outputs = torch.zeros_like(inputs)
-        log_abs_det = torch.zeros(batch_size, device=inputs.device)
+        log_abs_det = torch.zeros_like(inputs)
         
-        # Handle inputs outside the interval with identity + small slope
+        # Handle inputs outside the interval with linear transformation
         if outside_interval_mask.any():
+            # Get first derivative for constant slope
+            first_derivative = F.softplus(unnormalized_derivatives[..., 0]) + self.min_derivative
             outputs[outside_interval_mask] = inputs[outside_interval_mask]
-            # No change to log_abs_det for identity transform (log(1) = 0)
+            log_abs_det[outside_interval_mask] = torch.log(first_derivative[outside_interval_mask])
         
         if inside_interval_mask.any():
-            # Extract inputs inside the interval
             inputs_inside = inputs[inside_interval_mask]
+            params_inside = params[inside_interval_mask]
             
-            if inputs_inside.numel() > 0:
-                # For this PoC, use simple linear transformation
-                # In practice, this would implement full rational quadratic splines
-                scale = 1.0
-                outputs[inside_interval_mask] = inputs_inside * scale
+            # Process parameters for inside inputs only
+            unnorm_w_inside = params_inside[..., :num_bins]
+            unnorm_h_inside = params_inside[..., num_bins:2*num_bins]
+            unnorm_d_inside = params_inside[..., 2*num_bins:]
+            
+            widths = F.softmax(unnorm_w_inside, dim=-1) * 2 * self.tail_bound
+            heights = F.softmax(unnorm_h_inside, dim=-1) * 2 * self.tail_bound
+            derivatives = F.softplus(unnorm_d_inside) + self.min_derivative
+            
+            # Ensure minimum width and height
+            widths = widths * (2 * self.tail_bound - num_bins * self.min_bin_width) + self.min_bin_width
+            heights = heights * (2 * self.tail_bound - num_bins * self.min_bin_height) + self.min_bin_height
+            
+            # Compute cumulative widths and heights (bin boundaries)
+            cumwidths = torch.cumsum(widths, dim=-1)
+            cumwidths = F.pad(cumwidths, (1, 0), mode='constant', value=-self.tail_bound)
+            cumwidths[..., -1] = self.tail_bound
+            
+            cumheights = torch.cumsum(heights, dim=-1)
+            cumheights = F.pad(cumheights, (1, 0), mode='constant', value=-self.tail_bound)
+            cumheights[..., -1] = self.tail_bound
+            
+            # Find which bin each input belongs to
+            bin_indices = searchsorted(cumwidths, inputs_inside)
+            
+            # Get bin boundaries for each input
+            input_cumwidths = cumwidths.gather(-1, bin_indices[..., None])
+            input_cumwidths_next = cumwidths.gather(-1, (bin_indices + 1)[..., None])
+            input_cumheights = cumheights.gather(-1, bin_indices[..., None])
+            input_cumheights_next = cumheights.gather(-1, (bin_indices + 1)[..., None])
+            
+            input_derivatives = derivatives.gather(-1, bin_indices[..., None])
+            input_derivatives_next = derivatives.gather(-1, (bin_indices + 1)[..., None])
+            
+            # Compute bin widths and heights
+            input_bin_widths = input_cumwidths_next - input_cumwidths
+            input_bin_heights = input_cumheights_next - input_cumheights
+            
+            # Normalize input position within the bin
+            theta = (inputs_inside[..., None] - input_cumwidths) / input_bin_widths
+            theta = theta.squeeze(-1)
+            
+            if not inverse:
+                # Forward transformation
+                # Rational quadratic spline formula
+                numerator = input_bin_heights * (input_derivatives * theta[..., None]**2 + 
+                                               input_derivatives_next * theta[..., None] * (1 - theta[..., None]))
+                denominator = input_derivatives * theta[..., None]**2 + 2 * input_derivatives_next * theta[..., None] * (1 - theta[..., None]) + (1 - theta[..., None])**2
                 
-                # Find which batch elements have any inside interval inputs
-                inside_batch_mask = inside_interval_mask.any(dim=1) if inside_interval_mask.dim() > 1 else inside_interval_mask
+                outputs_inside = input_cumheights.squeeze(-1) + (numerator / denominator).squeeze(-1)
                 
-                # **FIX: Only update log_abs_det for elements that actually have inside interval inputs**
-                if inside_batch_mask.any():
-                    # Create log_det contribution for inside elements only
-                    inside_log_det = torch.zeros(inside_batch_mask.sum().item(), device=inputs.device)
-                    log_abs_det[inside_batch_mask] += inside_log_det
+                # Compute log absolute determinant of Jacobian
+                derivative_numerator = (input_derivatives_next * input_derivatives * input_bin_heights * 
+                                      denominator**2)
+                
+                log_abs_det_inside = torch.log(derivative_numerator.squeeze(-1) / 
+                                             (input_bin_widths.squeeze(-1) * denominator.squeeze(-1)**2))
+                
+            else:
+                # Inverse transformation - solve rational quadratic equation
+                y_rel = (inputs_inside[..., None] - input_cumheights) / input_bin_heights
+                y_rel = y_rel.squeeze(-1)
+                
+                # Quadratic formula coefficients
+                a = input_bin_heights * (input_derivatives - input_derivatives_next) + y_rel[..., None] * (input_derivatives_next - input_derivatives)
+                b = input_bin_heights * input_derivatives_next - y_rel[..., None] * (input_derivatives + input_derivatives_next)
+                c = -input_derivatives * y_rel[..., None]
+                
+                # Solve quadratic equation
+                discriminant = b**2 - 4 * a * c
+                theta = 2 * c / (-b - torch.sqrt(discriminant))
+                theta = theta.squeeze(-1)
+                
+                outputs_inside = input_cumwidths.squeeze(-1) + theta * input_bin_widths.squeeze(-1)
+                
+                # Compute log absolute determinant (inverse)
+                denominator = input_derivatives * theta[..., None]**2 + 2 * input_derivatives_next * theta[..., None] * (1 - theta[..., None]) + (1 - theta[..., None])**2
+                derivative_numerator = input_derivatives_next * input_derivatives * input_bin_heights * denominator**2
+                
+                log_abs_det_inside = -torch.log(derivative_numerator.squeeze(-1) / 
+                                              (input_bin_widths.squeeze(-1) * denominator.squeeze(-1)**2))
+            
+            outputs[inside_interval_mask] = outputs_inside
+            log_abs_det[inside_interval_mask] = log_abs_det_inside
         
-        return outputs, log_abs_det
-    
-    def _forward_spline(self, inputs, cumwidths, cumheights, derivatives):
-        """Forward rational quadratic spline transformation."""
-        # Simplified implementation using linear transformation
-        batch_size = inputs.size(0)
+        # Restore original shape
+        outputs = outputs.view(original_shape)
+        log_abs_det = log_abs_det.view(original_shape)
         
-        # Just apply a simple linear transformation for this PoC
-        scale = 1.0
-        outputs = inputs * scale
-        log_abs_det = torch.zeros(batch_size, device=inputs.device)
-        
-        return outputs, log_abs_det
-    
-    def _inverse_spline(self, inputs, cumwidths, cumheights, derivatives):
-        """Inverse rational quadratic spline transformation."""
-        # Simplified implementation - just return the inputs for identity transform
-        batch_size = inputs.size(0)
-        log_abs_det = torch.zeros(batch_size, device=inputs.device)
-        return inputs, log_abs_det
+        return outputs, log_abs_det.sum() if log_abs_det.numel() > 1 else log_abs_det
 
 class SplineFlow(BaseFlow):
     """Neural Spline Flow using rational quadratic splines."""
@@ -99,8 +171,7 @@ class SplineFlow(BaseFlow):
                 nn.ReLU(),
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.ReLU(),
-                nn.Linear(hidden_dim, output_dim),
-                nn.Tanh()  # Bounded output for stability
+                nn.Linear(hidden_dim, output_dim)
             )
             
             self.transforms.append(transform_net)
@@ -141,6 +212,7 @@ class SplineFlow(BaseFlow):
                 params_per_dim = spline_params.size(-1) // n_target
                 
                 transformed_target = torch.zeros_like(target_input)
+                log_det_layer = torch.zeros(x.size(0), device=x.device)
                 
                 for j in range(n_target):
                     start_idx = j * params_per_dim
@@ -149,16 +221,18 @@ class SplineFlow(BaseFlow):
                     
                     # Apply spline transformation
                     transformed_dim, log_det_dim = self.splines[i](
-                        target_input[:, j:j+1], dim_params, inverse=False
+                        target_input[:, j], dim_params, inverse=False
                     )
                     
-                    transformed_target[:, j:j+1] = transformed_dim
-                    log_det_total += log_det_dim
+                    transformed_target[:, j] = transformed_dim
+                    log_det_layer = log_det_layer + log_det_dim
                 
                 # Reconstruct z
                 z_new = z.clone()
                 z_new[:, target_indices] = transformed_target
                 z = z_new
+                
+                log_det_total = log_det_total + log_det_layer
         
         return z, log_det_total
     
@@ -192,10 +266,10 @@ class SplineFlow(BaseFlow):
                     dim_params = spline_params[:, start_idx:end_idx]
                     
                     transformed_dim, _ = self.splines[i](
-                        target_input[:, j:j+1], dim_params, inverse=True
+                        target_input[:, j], dim_params, inverse=True
                     )
                     
-                    transformed_target[:, j:j+1] = transformed_dim
+                    transformed_target[:, j] = transformed_dim
                 
                 # Reconstruct x
                 x_new = x.clone()
