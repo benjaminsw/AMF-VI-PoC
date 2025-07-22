@@ -3,7 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.metrics import pairwise_distances
 from scipy.spatial.distance import cdist
-from sequential_amf_vi import SequentialAMFVI
+from sequential_amf_vi_hybrid import SequentialAMFVI
 from data.data_generator import generate_data, get_available_datasets
 import os
 import pickle
@@ -87,40 +87,115 @@ def evaluate_individual_flows(model, test_data, flow_names):
     
     return individual_metrics
 
+def evaluate_meta_learner_weights(model, test_data, flow_names):
+    """Evaluate meta-learner weight distribution and specialization."""
+    if not hasattr(model, 'meta_trained') or not model.meta_trained:
+        return None
+    
+    with torch.no_grad():
+        # Get adaptive weights for test data
+        model_output = model.forward(test_data)
+        weights = model_output['weights'].cpu().numpy()
+        
+        # Analyze weight statistics
+        weight_stats = {}
+        for i, name in enumerate(flow_names):
+            weight_stats[name] = {
+                'mean': weights[:, i].mean(),
+                'std': weights[:, i].std(),
+                'min': weights[:, i].min(),
+                'max': weights[:, i].max(),
+                'entropy': -np.mean(weights[:, i] * np.log(weights[:, i] + 1e-8))
+            }
+        
+        # Overall weight diversity (entropy)
+        weight_entropy = -np.mean(np.sum(weights * np.log(weights + 1e-8), axis=1))
+        
+        return {
+            'weight_stats': weight_stats,
+            'weight_entropy': weight_entropy,
+            'weights_matrix': weights
+        }
+
+def evaluate_training_progression(saved_data):
+    """Evaluate the three-stage training progression (NEW)."""
+    flow_losses = saved_data.get('flow_losses', [])
+    meta_losses = saved_data.get('meta_losses', [])
+    joint_losses = saved_data.get('joint_losses', [])  # NEW
+    
+    progression_metrics = {
+        'stage1_epochs': len(flow_losses[0]) if flow_losses else 0,
+        'stage2_epochs': len(meta_losses),
+        'stage3_epochs': len(joint_losses),  # NEW
+        'total_epochs': 0,
+        'stage1_improvement': 0,
+        'stage2_improvement': 0,
+        'stage3_improvement': 0  # NEW
+    }
+    
+    # Calculate training improvements
+    if flow_losses:
+        progression_metrics['total_epochs'] += len(flow_losses[0])
+        if len(flow_losses[0]) > 10:
+            initial_loss = np.mean(flow_losses[0][:10])
+            final_loss = np.mean(flow_losses[0][-10:])
+            progression_metrics['stage1_improvement'] = initial_loss - final_loss
+    
+    if meta_losses:
+        progression_metrics['total_epochs'] += len(meta_losses)
+        if len(meta_losses) > 10:
+            initial_loss = np.mean(meta_losses[:10])
+            final_loss = np.mean(meta_losses[-10:])
+            progression_metrics['stage2_improvement'] = initial_loss - final_loss
+    
+    # NEW: Joint training analysis
+    if joint_losses:
+        progression_metrics['total_epochs'] += len(joint_losses)
+        if len(joint_losses) > 10:
+            initial_loss = np.mean(joint_losses[:10])
+            final_loss = np.mean(joint_losses[-10:])
+            progression_metrics['stage3_improvement'] = initial_loss - final_loss
+    
+    return progression_metrics
+
 def evaluate_single_dataset(dataset_name):
-    """Evaluate a single trained sequential model."""
+    """Evaluate a single trained sequential hybrid model."""
     
     print(f"\n{'='*50}")
-    print(f"Evaluating {dataset_name.upper()} dataset")
+    print(f"Evaluating {dataset_name.upper()} dataset (Hybrid Training)")
     print(f"{'='*50}")
     
     # Create test data
     test_data = generate_data(dataset_name, n_samples=2000)
     
-    # Load pre-trained model
+    # Load pre-trained model (UPDATED PATH)
     results_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'results')
-    model_path = os.path.join(results_dir, f'trained_model_{dataset_name}.pkl')
+    model_path = os.path.join(results_dir, f'trained_model_hybrid_{dataset_name}.pkl')
     
     if not os.path.exists(model_path):
         print(f"❌ Model file not found at {model_path}")
-        print("Please run the training script first: python main/sequential_amf_vi.py")
+        print("Please run the training script first: python sequential_amf_vi_hybrid.py")
         return None
     
     with open(model_path, 'rb') as f:
         saved_data = pickle.load(f)
         if isinstance(saved_data, dict):
             model = saved_data['model']
-            losses = saved_data.get('losses', [])
+            flow_losses = saved_data.get('flow_losses', [])
+            meta_losses = saved_data.get('meta_losses', [])
+            joint_losses = saved_data.get('joint_losses', [])  # NEW
         else:
             model = saved_data  # Legacy format
-            losses = []
+            flow_losses = []
+            meta_losses = []
+            joint_losses = []
     
     # Ensure model and data are on the same device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
     test_data = test_data.to(device)
     
-    # Updated flow names to match sequential_amf_vi_updated.py
+    # Updated flow names to match hybrid version
     flow_names = ['realnvp', 'maf', 'iaf']
     
     # Generate samples for evaluation
@@ -138,13 +213,19 @@ def evaluate_single_dataset(dataset_name):
     quality = compute_quality(test_data, generated_samples)
     diversity_metrics = evaluate_flow_diversity(model)
     
-    # For sequential model, approximate log probability using flow predictions
+    # For hybrid model, use adaptive mixture log probability (UPDATED)
     with torch.no_grad():
-        flow_predictions = model.get_flow_predictions(test_data)
-        log_prob = torch.logsumexp(flow_predictions, dim=1).mean().item()
+        model_output = model.forward(test_data)
+        log_prob = model_output['mixture_log_prob'].mean().item()
     
     # Evaluate individual flows
     individual_flow_metrics = evaluate_individual_flows(model, test_data, flow_names[:len(model.flows)])
+    
+    # Evaluate meta-learner weights
+    meta_learner_metrics = evaluate_meta_learner_weights(model, test_data, flow_names[:len(model.flows)])
+    
+    # Evaluate training progression (NEW)
+    progression_metrics = evaluate_training_progression(saved_data)
     
     results = {
         'dataset': dataset_name,
@@ -157,8 +238,12 @@ def evaluate_single_dataset(dataset_name):
         'generated_samples': generated_samples,
         'test_data': test_data,
         'model': model,
-        'losses': losses,
-        'individual_flow_metrics': individual_flow_metrics
+        'flow_losses': flow_losses,
+        'meta_losses': meta_losses,
+        'joint_losses': joint_losses,  # NEW
+        'individual_flow_metrics': individual_flow_metrics,
+        'meta_learner_metrics': meta_learner_metrics,
+        'progression_metrics': progression_metrics  # NEW
     }
     
     print(f"📊 Overall Mixture Results for {dataset_name}:")
@@ -166,6 +251,23 @@ def evaluate_single_dataset(dataset_name):
     print(f"   Quality: {quality:.3f}")
     print(f"   Log Probability: {log_prob:.3f}")
     print(f"   Flow Separation: {diversity_metrics['avg_separation']:.3f}")
+    
+    # Print meta-learner analysis
+    if meta_learner_metrics:
+        print(f"\n🧠 Meta-Learner Analysis:")
+        print(f"   Weight Entropy (diversity): {meta_learner_metrics['weight_entropy']:.3f}")
+        for name, stats in meta_learner_metrics['weight_stats'].items():
+            print(f"   {name.upper()} weight - Mean: {stats['mean']:.3f}, Std: {stats['std']:.3f}")
+    
+    # Print training progression analysis (NEW)
+    print(f"\n🏁 Training Progression Analysis:")
+    print(f"   Stage 1 (Flows): {progression_metrics['stage1_epochs']} epochs, "
+          f"Improvement: {progression_metrics['stage1_improvement']:.3f}")
+    print(f"   Stage 2 (Meta-learner): {progression_metrics['stage2_epochs']} epochs, "
+          f"Improvement: {progression_metrics['stage2_improvement']:.3f}")
+    print(f"   Stage 3 (Joint): {progression_metrics['stage3_epochs']} epochs, "
+          f"Improvement: {progression_metrics['stage3_improvement']:.3f}")
+    print(f"   Total training: {progression_metrics['total_epochs']} epochs")
     
     # Print individual flow performance
     print(f"\n📊 Individual Flow Results:")
@@ -186,7 +288,7 @@ def evaluate_single_dataset(dataset_name):
     return results
 
 def comprehensive_evaluation():
-    """Comprehensive evaluation of all trained Sequential AMF-VI models."""
+    """Comprehensive evaluation of all trained Sequential AMF-VI Hybrid models."""
     
     # Define datasets to evaluate
     datasets = ['banana', 'x_shape', 'bimodal_shared', 'bimodal_different']
@@ -236,47 +338,71 @@ def comprehensive_evaluation():
         plot_samples(results['generated_samples'], f"Generated Samples", 
                     axes[1, i], color='red', alpha=0.6)
         
-        # Row 3: Flow separation matrix
-        pairwise_dists = results['diversity_metrics']['pairwise_distances'].detach().cpu().numpy()
-        im = axes[2, i].imshow(pairwise_dists, cmap='viridis')
-        axes[2, i].set_title(f"Flow Separation")
-        plt.colorbar(im, ax=axes[2, i])
+        # Row 3: Training progression bar chart (NEW)
+        stages = ['Stage 1', 'Stage 2', 'Stage 3']
+        epochs = [
+            results['progression_metrics']['stage1_epochs'],
+            results['progression_metrics']['stage2_epochs'],
+            results['progression_metrics']['stage3_epochs']
+        ]
+        improvements = [
+            results['progression_metrics']['stage1_improvement'],
+            results['progression_metrics']['stage2_improvement'],
+            results['progression_metrics']['stage3_improvement']
+        ]
+        
+        ax3 = axes[2, i]
+        x_pos = np.arange(len(stages))
+        bars = ax3.bar(x_pos, epochs, color=['skyblue', 'lightgreen', 'lightcoral'])
+        ax3.set_title(f"Training Stages")
+        ax3.set_xlabel('Training Stage')
+        ax3.set_ylabel('Epochs')
+        ax3.set_xticks(x_pos)
+        ax3.set_xticklabels(stages)
+        
+        # Add improvement text on bars
+        for j, (bar, improvement) in enumerate(zip(bars, improvements)):
+            height = bar.get_height()
+            ax3.text(bar.get_x() + bar.get_width()/2., height/2,
+                    f'{improvement:.2f}', ha='center', va='center', fontsize=8)
     
     plt.tight_layout()
-    plt.suptitle('Sequential AMF-VI Evaluation Results - All Datasets', fontsize=16, y=0.98)
+    plt.suptitle('Sequential AMF-VI Hybrid Evaluation - All Datasets', fontsize=16, y=0.98)
     
-    # Save comprehensive plot
+    # Save comprehensive plot (UPDATED FILENAME)
     results_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'results')
     os.makedirs(results_dir, exist_ok=True)
-    plt.savefig(os.path.join(results_dir, 'sequential_comprehensive_evaluation.png'), 
+    plt.savefig(os.path.join(results_dir, 'sequential_hybrid_comprehensive_evaluation.png'), 
                 dpi=300, bbox_inches='tight')
-    plt.close(fig)  # turn off the plot
-    # plt.show()  # Comment out or remove this
+    plt.close(fig)
     
     # Create summary table
     print(f"\n{'='*80}")
-    print("SUMMARY TABLE - MIXTURE RESULTS")
+    print("SUMMARY TABLE - HYBRID MIXTURE RESULTS")
     print(f"{'='*80}")
-    print(f"{'Dataset':<15} | {'Coverage':<8} | {'Quality':<8} | {'Log Prob':<10} | {'Flow Sep':<8}")
+    print(f"{'Dataset':<15} | {'Coverage':<8} | {'Quality':<8} | {'Log Prob':<10} | {'Total Epochs':<12}")
     print("-" * 80)
     
     summary_data = []
     for dataset_name, results in all_results.items():
+        total_epochs = results['progression_metrics']['total_epochs']
         print(f"{dataset_name:<15} | {results['coverage']:<8.3f} | {results['quality']:<8.3f} | "
-              f"{results['log_probability']:<10.3f} | {results['flow_separation']:<8.3f}")
+              f"{results['log_probability']:<10.3f} | {total_epochs:<12}")
         
         summary_data.append([
             dataset_name,
             results['coverage'],
             results['quality'],
             results['log_probability'],
-            results['flow_separation']
+            results['flow_separation'],
+            results['meta_learner_metrics']['weight_entropy'] if results['meta_learner_metrics'] else 0.0,
+            total_epochs
         ])
     
-    # Save mixture metrics to CSV
-    with open(os.path.join(results_dir, 'sequential_comprehensive_metrics.csv'), 'w', newline='') as f:
+    # Save mixture metrics to CSV (UPDATED FILENAME)
+    with open(os.path.join(results_dir, 'sequential_hybrid_comprehensive_metrics.csv'), 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['dataset', 'coverage', 'quality', 'log_probability', 'flow_separation'])
+        writer.writerow(['dataset', 'coverage', 'quality', 'log_probability', 'flow_separation', 'weight_entropy', 'total_epochs'])
         writer.writerows(summary_data)
     
     # Create individual flow metrics CSV
@@ -289,32 +415,38 @@ def comprehensive_evaluation():
     
     for dataset_name, results in all_results.items():
         print(f"\n{dataset_name.upper()} Dataset:")
-        print(f"{'Flow':<8} | {'Coverage':<8} | {'Quality':<8} | {'Log Prob':<10}")
-        print("-" * 50)
+        print(f"{'Flow':<8} | {'Coverage':<8} | {'Quality':<8} | {'Log Prob':<10} | {'Avg Weight':<10}")
+        print("-" * 65)
         
         if 'individual_flow_metrics' in results:
             for flow_name, metrics in results['individual_flow_metrics'].items():
+                # Get average weight from meta-learner
+                avg_weight = 0.0
+                if results['meta_learner_metrics']:
+                    avg_weight = results['meta_learner_metrics']['weight_stats'][flow_name]['mean']
+                
                 print(f"{flow_name.upper():<8} | {metrics['coverage']:<8.3f} | {metrics['quality']:<8.3f} | "
-                      f"{metrics['log_probability']:<10.3f}")
+                      f"{metrics['log_probability']:<10.3f} | {avg_weight:<10.3f}")
                 
                 individual_flow_data.append([
                     dataset_name,
                     flow_name,
                     metrics['coverage'],
                     metrics['quality'],
-                    metrics['log_probability']
+                    metrics['log_probability'],
+                    avg_weight
                 ])
     
-    # Save individual flow metrics to CSV
-    with open(os.path.join(results_dir, 'sequential_individual_flow_metrics.csv'), 'w', newline='') as f:
+    # Save individual flow metrics to CSV (UPDATED FILENAME)
+    with open(os.path.join(results_dir, 'sequential_hybrid_individual_flow_metrics.csv'), 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['dataset', 'flow_name', 'coverage', 'quality', 'log_probability'])
+        writer.writerow(['dataset', 'flow_name', 'coverage', 'quality', 'log_probability', 'avg_weight'])
         writer.writerows(individual_flow_data)
     
     print(f"\n✅ Comprehensive evaluation completed!")
-    print(f"   Results saved to: {os.path.join(results_dir, 'sequential_comprehensive_evaluation.png')}")
-    print(f"   Mixture metrics saved to: {os.path.join(results_dir, 'sequential_comprehensive_metrics.csv')}")
-    print(f"   Individual flow metrics saved to: {os.path.join(results_dir, 'sequential_individual_flow_metrics.csv')}")
+    print(f"   Results saved to: {os.path.join(results_dir, 'sequential_hybrid_comprehensive_evaluation.png')}")
+    print(f"   Mixture metrics saved to: {os.path.join(results_dir, 'sequential_hybrid_comprehensive_metrics.csv')}")
+    print(f"   Individual flow metrics saved to: {os.path.join(results_dir, 'sequential_hybrid_individual_flow_metrics.csv')}")
     
     # Best performing dataset (mixture)
     best_dataset = max(all_results.items(), key=lambda x: x[1]['coverage'])
@@ -332,6 +464,18 @@ def comprehensive_evaluation():
     
     if best_individual_flow:
         print(f"🏆 Best performing individual flow: {best_individual_flow[1].upper()} on {best_individual_flow[0]} (Coverage: {best_coverage:.3f})")
+    
+    # Most balanced meta-learner
+    most_balanced = max(all_results.items(), 
+                       key=lambda x: x[1]['meta_learner_metrics']['weight_entropy'] if x[1]['meta_learner_metrics'] else 0)
+    if most_balanced[1]['meta_learner_metrics']:
+        entropy = most_balanced[1]['meta_learner_metrics']['weight_entropy']
+        print(f"🎯 Most balanced meta-learner: {most_balanced[0]} (Weight Entropy: {entropy:.3f})")
+    
+    # Most efficient training (NEW)
+    most_efficient = min(all_results.items(), key=lambda x: x[1]['progression_metrics']['total_epochs'])
+    total_epochs = most_efficient[1]['progression_metrics']['total_epochs']
+    print(f"⚡ Most efficient training: {most_efficient[0]} ({total_epochs} total epochs)")
     
     return all_results
 
