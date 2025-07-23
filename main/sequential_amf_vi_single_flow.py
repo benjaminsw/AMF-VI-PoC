@@ -18,8 +18,9 @@ class SequentialAMFVI(nn.Module):
         super().__init__()
         self.dim = dim
         
+        # CHANGE: Default to single flow for testing
         if flow_types is None:
-            flow_types = ['realnvp', 'maf', 'iaf']
+            flow_types = ['realnvp']  # Changed from ['realnvp', 'maf', 'iaf']
         
         # Create flows
         self.flows = nn.ModuleList()
@@ -27,10 +28,11 @@ class SequentialAMFVI(nn.Module):
             if flow_type == 'realnvp':
                 self.flows.append(RealNVPFlow(dim, n_layers=1))
             elif flow_type == 'maf':
-                self.flows.append(MAFFlow(dim, n_layers=1))
+                self.flows.append(MAFFlow(dim, n_layers=3))
             elif flow_type == 'iaf':
-                self.flows.append(IAFFlow(dim, n_layers=1))
-
+                self.flows.append(IAFFlow(dim, n_layers=3))
+            elif flow_type == 'spline':
+                self.flows.append(SplineFlow(dim, n_layers=8))
         
         # Meta-learner for adaptive weights
         self.meta_learner = nn.Sequential(
@@ -155,6 +157,33 @@ class SequentialAMFVI(nn.Module):
                 flow_log_probs.append(log_prob.unsqueeze(1))
         
         return torch.cat(flow_log_probs, dim=1)  # [batch, n_flows]
+    
+    # CHANGE: Add method to get direct flow performance for comparison
+    def get_direct_flow_performance(self, data):
+        """Get performance of the flow directly without meta-learner."""
+        if not self.flows_trained:
+            raise RuntimeError("Flows must be trained first!")
+        
+        self.eval()
+        with torch.no_grad():
+            # For single flow, just return its log probability
+            if len(self.flows) == 1:
+                log_prob = self.flows[0].log_prob(data)
+                return {'log_prob': log_prob, 'mean_log_prob': log_prob.mean()}
+            else:
+                # For multiple flows, return uniform mixture
+                flow_log_probs = []
+                for flow in self.flows:
+                    log_prob = flow.log_prob(data)
+                    flow_log_probs.append(log_prob.unsqueeze(1))
+                
+                flow_predictions = torch.cat(flow_log_probs, dim=1)
+                # Uniform weights
+                uniform_weights = torch.ones_like(flow_predictions) / len(self.flows)
+                weighted_log_probs = flow_predictions + torch.log(uniform_weights + 1e-8)
+                mixture_log_prob = torch.logsumexp(weighted_log_probs, dim=1)
+                
+                return {'log_prob': mixture_log_prob, 'mean_log_prob': mixture_log_prob.mean()}
     
     def forward(self, x):
         """Forward pass with adaptive meta-learner weights."""
@@ -281,10 +310,43 @@ class SequentialAMFVI(nn.Module):
         
         return torch.cat(all_samples, dim=0)
 
-def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plots=False):
+def compute_coverage(target_samples, generated_samples, threshold=0.1):
+    """Compute mode coverage metric."""
+    from scipy.spatial.distance import cdist
+    target_np = target_samples.detach().cpu().numpy()
+    generated_np = generated_samples.detach().cpu().numpy()
+    
+    # For each target sample, find closest generated sample
+    distances = cdist(target_np, generated_np)
+    min_distances = distances.min(axis=1)
+    
+    # Coverage: fraction of target samples within threshold
+    coverage = (min_distances < threshold).mean()
+    return coverage
+
+def compute_quality(target_samples, generated_samples, threshold=0.1):
+    """Compute sample quality metric."""
+    from scipy.spatial.distance import cdist
+    target_np = target_samples.detach().cpu().numpy()
+    generated_np = generated_samples.detach().cpu().numpy()
+    
+    # For each generated sample, find closest target sample
+    distances = cdist(generated_np, target_np)
+    min_distances = distances.min(axis=1)
+    
+    # Quality: fraction of generated samples within threshold
+    quality = (min_distances < threshold).mean()
+    return quality
+
+def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plots=False, flow_types=None):
     """Train sequential AMF-VI with meta-learner weights."""
     
+    # CHANGE: Allow specifying flow types
+    if flow_types is None:
+        flow_types = ['realnvp']  # Default to single RealNVP for testing
+    
     print(f"🚀 Sequential AMF-VI with Meta-Learner on {dataset_name}")
+    print(f"Using flows: {flow_types}")
     print("=" * 60)
     
     # Generate data
@@ -293,14 +355,35 @@ def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plo
     data = data.to(device)
     
     # Create sequential model
-    model = SequentialAMFVI(dim=2, flow_types=['realnvp', 'maf', 'iaf'])
+    model = SequentialAMFVI(dim=2, flow_types=flow_types)
     model = model.to(device)
     
     # Stage 1: Train flows independently
     flow_losses = model.train_flows_independently(data, epochs=200, lr=1e-3)
     
+    # CHANGE: Test direct flow performance before meta-learner training
+    print("\n📊 Direct Flow Performance (before meta-learner):")
+    direct_perf = model.get_direct_flow_performance(data)
+    print(f"Direct flow mean log-prob: {direct_perf['mean_log_prob']:.4f}")
+    
     # Stage 2: Train meta-learner
     meta_losses = model.train_meta_learner(data, epochs=200, lr=1e-3)
+    
+    # CHANGE: Test adaptive performance after meta-learner training
+    print("\n📊 Adaptive Performance (after meta-learner):")
+    model.eval()
+    with torch.no_grad():
+        adaptive_output = model.forward(data)
+        adaptive_mean_log_prob = adaptive_output['mixture_log_prob'].mean()
+        print(f"Adaptive mean log-prob: {adaptive_mean_log_prob:.4f}")
+        
+        # Compare performance
+        performance_diff = adaptive_mean_log_prob - direct_perf['mean_log_prob']
+        print(f"Performance difference: {performance_diff:.4f}")
+        if performance_diff >= 0:
+            print("✅ Adaptive performance is equal or better!")
+        else:
+            print("⚠️  Adaptive performance is worse - check meta-learner training")
     
     # Evaluation and visualization
     print("\n🎨 Generating visualizations...")
@@ -310,59 +393,96 @@ def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plo
         # Generate samples using adaptive sampling
         model_samples = model.sample(1000)
         
-        # Individual flow samples for comparison
-        flow_samples = {}
-        flow_names = ['realnvp', 'maf', 'iaf']
-        for i, name in enumerate(flow_names):
-            flow_samples[name] = model.flows[i].sample(1000)
+        # CHANGE: Generate direct flow samples for comparison
+        direct_samples = []
+        for flow in model.flows:
+            flow.eval()
+            direct_samples.append(flow.sample(1000))
         
         # Get sample weights to analyze meta-learner behavior
         sample_output = model.forward(data[:100])  # First 100 samples
         avg_weights = sample_output['weights'].mean(dim=0).cpu().numpy()
         
-        # Create visualization
-        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-        
-        # Plot target data
-        data_np = data.cpu().numpy()
-        axes[0, 0].scatter(data_np[:, 0], data_np[:, 1], alpha=0.6, c='blue', s=20)
-        axes[0, 0].set_title('Target Data')
-        axes[0, 0].grid(True, alpha=0.3)
-        
-        # Plot sequential model samples (with adaptive sampling)
-        model_np = model_samples.cpu().numpy()
-        axes[0, 1].scatter(model_np[:, 0], model_np[:, 1], alpha=0.6, c='red', s=20)
-        axes[0, 1].set_title('Adaptive AMF-VI Samples')
-        axes[0, 1].grid(True, alpha=0.3)
-        
-        # Plot individual flows
-        colors = ['green', 'orange', 'purple']
-        for i, (name, samples) in enumerate(flow_samples.items()):
-            if i < 3:
-                row, col = (0, 2) if i == 0 else (1, i-1)
-                samples_np = samples.cpu().numpy()
-                axes[row, col].scatter(samples_np[:, 0], samples_np[:, 1], 
-                                     alpha=0.6, c=colors[i], s=20)
-                axes[row, col].set_title(f'{name.upper()} Flow')
-                axes[row, col].grid(True, alpha=0.3)
-        
-        # Plot meta-learner training loss
-        if meta_losses:
-            axes[1, 2].plot(meta_losses, label='Meta-Learner', color='red', linewidth=2)
-            axes[1, 2].set_title('Meta-Learner Training Loss')
-            axes[1, 2].set_xlabel('Epoch')
-            axes[1, 2].set_ylabel('Loss')
-            axes[1, 2].grid(True, alpha=0.3)
-            axes[1, 2].legend()
-        
-        plt.tight_layout()
-        plt.suptitle(f'Sequential AMF-VI with Adaptive Sampling - {dataset_name.title()}', fontsize=16)
+        # CHANGE: Create visualization comparing direct vs adaptive
+        if len(flow_types) == 1:
+            # Single flow comparison
+            fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+            
+            # Plot target data
+            data_np = data.cpu().numpy()
+            axes[0, 0].scatter(data_np[:, 0], data_np[:, 1], alpha=0.6, c='blue', s=20)
+            axes[0, 0].set_title('Target Data')
+            axes[0, 0].grid(True, alpha=0.3)
+            
+            # Plot direct flow samples
+            direct_np = direct_samples[0].cpu().numpy()
+            axes[0, 1].scatter(direct_np[:, 0], direct_np[:, 1], alpha=0.6, c='green', s=20)
+            axes[0, 1].set_title(f'Direct {flow_types[0].upper()} Samples')
+            axes[0, 1].grid(True, alpha=0.3)
+            
+            # Plot adaptive samples
+            model_np = model_samples.cpu().numpy()
+            axes[1, 0].scatter(model_np[:, 0], model_np[:, 1], alpha=0.6, c='red', s=20)
+            axes[1, 0].set_title('Adaptive Samples')
+            axes[1, 0].grid(True, alpha=0.3)
+            
+            # Plot training losses
+            axes[1, 1].plot(flow_losses[0], label='Flow Training', color='green', linewidth=2)
+            if meta_losses:
+                axes[1, 1].plot(meta_losses, label='Meta-Learner', color='red', linewidth=2)
+            axes[1, 1].set_title('Training Losses')
+            axes[1, 1].set_xlabel('Epoch')
+            axes[1, 1].set_ylabel('Loss')
+            axes[1, 1].grid(True, alpha=0.3)
+            axes[1, 1].legend()
+            
+            plt.tight_layout()
+            plt.suptitle(f'Direct vs Adaptive Comparison - {dataset_name.title()}', fontsize=16)
+        else:
+            # Original multi-flow visualization
+            fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+            
+            # Plot target data
+            data_np = data.cpu().numpy()
+            axes[0, 0].scatter(data_np[:, 0], data_np[:, 1], alpha=0.6, c='blue', s=20)
+            axes[0, 0].set_title('Target Data')
+            axes[0, 0].grid(True, alpha=0.3)
+            
+            # Plot sequential model samples (with adaptive sampling)
+            model_np = model_samples.cpu().numpy()
+            axes[0, 1].scatter(model_np[:, 0], model_np[:, 1], alpha=0.6, c='red', s=20)
+            axes[0, 1].set_title('Adaptive AMF-VI Samples')
+            axes[0, 1].grid(True, alpha=0.3)
+            
+            # Plot individual flows
+            colors = ['green', 'orange', 'purple']
+            for i, samples in enumerate(direct_samples):
+                if i < 3:
+                    row, col = (0, 2) if i == 0 else (1, i-1)
+                    samples_np = samples.cpu().numpy()
+                    axes[row, col].scatter(samples_np[:, 0], samples_np[:, 1], 
+                                         alpha=0.6, c=colors[i], s=20)
+                    axes[row, col].set_title(f'{flow_types[i].upper()} Flow')
+                    axes[row, col].grid(True, alpha=0.3)
+            
+            # Plot meta-learner training loss
+            if meta_losses:
+                axes[1, 2].plot(meta_losses, label='Meta-Learner', color='red', linewidth=2)
+                axes[1, 2].set_title('Meta-Learner Training Loss')
+                axes[1, 2].set_xlabel('Epoch')
+                axes[1, 2].set_ylabel('Loss')
+                axes[1, 2].grid(True, alpha=0.3)
+                axes[1, 2].legend()
+            
+            plt.tight_layout()
+            plt.suptitle(f'Sequential AMF-VI with Adaptive Sampling - {dataset_name.title()}', fontsize=16)
         
         # Save plot if requested
         if save_plots:
             results_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'results')
             os.makedirs(results_dir, exist_ok=True)
-            plot_path = os.path.join(results_dir, f'sequential_amf_vi_adaptive_results_{dataset_name}.png')
+            flow_str = '_'.join(flow_types)
+            plot_path = os.path.join(results_dir, f'sequential_amf_vi_adaptive_results_{dataset_name}_{flow_str}.png')
             fig.savefig(plot_path, dpi=300, bbox_inches='tight')
             print(f"✅ Plot saved to {plot_path}")
         
@@ -372,24 +492,45 @@ def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plo
         else:
             plt.close(fig)
         
-        # Print analysis
+        # CHANGE: Compute coverage and quality metrics
+        direct_samples = model.flows[0].sample(1000)
+        direct_coverage = compute_coverage(data, direct_samples)
+        direct_quality = compute_quality(data, direct_samples)
+        adaptive_coverage = compute_coverage(data, model_samples)
+        adaptive_quality = compute_quality(data, model_samples)
+        
+        # CHANGE: Enhanced analysis for single flow comparison
         print("\n📊 Analysis:")
         print(f"Target data mean: {data.mean(dim=0).cpu().numpy()}")
+        print(f"Direct flow mean: {direct_samples[0].mean(dim=0).cpu().numpy()}")
         print(f"Adaptive model mean: {model_samples.mean(dim=0).cpu().numpy()}")
         print(f"Target data std: {data.std(dim=0).cpu().numpy()}")
+        print(f"Direct flow std: {direct_samples[0].std(dim=0).cpu().numpy()}")
         print(f"Adaptive model std: {model_samples.std(dim=0).cpu().numpy()}")
+        
+        # CHANGE: Add Coverage and Quality comparison
+        print(f"\n📏 Coverage & Quality Metrics:")
+        print(f"Direct flow coverage: {direct_coverage:.3f}")
+        print(f"Adaptive coverage: {adaptive_coverage:.3f}")
+        print(f"Direct flow quality: {direct_quality:.3f}")
+        print(f"Adaptive quality: {adaptive_quality:.3f}")
+        coverage_diff = adaptive_coverage - direct_coverage
+        quality_diff = adaptive_quality - direct_quality
+        print(f"Coverage improvement: {coverage_diff:.3f} ({'better' if coverage_diff >= 0 else 'worse'})")
+        print(f"Quality improvement: {quality_diff:.3f} ({'better' if quality_diff >= 0 else 'worse'})")
         
         # Meta-learner weight analysis
         print(f"\n🧠 Meta-Learner Weight Analysis:")
-        for i, name in enumerate(flow_names):
+        for i, name in enumerate(flow_types):
             print(f"{name.upper()} average weight: {avg_weights[i]:.3f}")
         
-        # Check flow diversity
-        print("\n🔍 Flow Specialization Analysis:")
-        for i, (name, samples) in enumerate(flow_samples.items()):
-            mean = samples.mean(dim=0).cpu().numpy()
-            std = samples.std(dim=0).cpu().numpy()
-            print(f"{name.upper()}: Mean=[{mean[0]:.2f}, {mean[1]:.2f}], Std=[{std[0]:.2f}, {std[1]:.2f}]")
+        # Performance comparison summary
+        print(f"\n🔍 Performance Summary:")
+        print(f"Direct flow log-prob: {direct_perf['mean_log_prob']:.4f}")
+        print(f"Adaptive log-prob: {adaptive_mean_log_prob:.4f}")
+        print(f"Difference: {performance_diff:.4f} ({'better' if performance_diff >= 0 else 'worse'})")
+        print(f"Direct coverage: {direct_coverage:.3f}, Adaptive coverage: {adaptive_coverage:.3f}")
+        print(f"Direct quality: {direct_quality:.3f}, Adaptive quality: {adaptive_quality:.3f}")
         
         # Model complexity analysis
         print("\n🏗️ Model Architecture:")
@@ -397,7 +538,7 @@ def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plo
         for i, flow in enumerate(model.flows):
             n_params = sum(p.numel() for p in flow.parameters())
             total_params += n_params
-            print(f"{flow_names[i].upper()}: {n_params:,} parameters")
+            print(f"{flow_types[i].upper()}: {n_params:,} parameters")
         
         # Meta-learner parameters
         meta_params = sum(p.numel() for p in model.meta_learner.parameters())
@@ -408,22 +549,33 @@ def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plo
     # Save trained model
     results_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'results')
     os.makedirs(results_dir, exist_ok=True)
-    model_path = os.path.join(results_dir, f'trained_model_adaptive_{dataset_name}.pkl')
+    flow_str = '_'.join(flow_types)
+    model_path = os.path.join(results_dir, f'trained_model_adaptive_{dataset_name}_{flow_str}.pkl')
     
     with open(model_path, 'wb') as f:
         pickle.dump({
             'model': model, 
             'flow_losses': flow_losses,
             'meta_losses': meta_losses,
-            'dataset': dataset_name
+            'dataset': dataset_name,
+            'flow_types': flow_types,
+            'direct_performance': direct_perf,
+            'adaptive_performance': adaptive_mean_log_prob.item(),
+            'direct_coverage': direct_coverage,
+            'adaptive_coverage': adaptive_coverage,
+            'direct_quality': direct_quality,
+            'adaptive_quality': adaptive_quality
         }, f)
     print(f"✅ Model saved to {model_path}")
     
     return model, flow_losses, meta_losses
 
 if __name__ == "__main__":
-    # Run the sequential AMF-VI experiment on multiple datasets
+    # CHANGE: Test with single RealNVP flow
     datasets = ['banana', 'x_shape', 'bimodal_shared', 'bimodal_different']
+    
+    print("Testing with single RealNVP flow:")
+    print("="*60)
     
     for dataset_name in datasets:
         print(f"\n{'='*60}")
@@ -433,5 +585,18 @@ if __name__ == "__main__":
         model, flow_losses, meta_losses = train_sequential_amf_vi(
             dataset_name, 
             show_plots=False, 
-            save_plots=True
+            save_plots=True,
+            flow_types=['realnvp']  # Single flow for testing
         )
+    
+    # Uncomment to test with multiple flows for comparison
+    # print("\n\nTesting with multiple flows:")
+    # print("="*60)
+    # 
+    # for dataset_name in datasets[:1]:  # Test on one dataset
+    #     model, flow_losses, meta_losses = train_sequential_amf_vi(
+    #         dataset_name, 
+    #         show_plots=False, 
+    #         save_plots=True,
+    #         flow_types=['realnvp', 'maf', 'iaf']  # Multiple flows
+    #     )

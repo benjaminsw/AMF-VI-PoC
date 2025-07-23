@@ -3,9 +3,8 @@ import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
 from amf_vi.flows.realnvp import RealNVPFlow
-from amf_vi.flows.maf import MAFFlow
-from amf_vi.flows.iaf import IAFFlow
-from amf_vi.flows.spline import SplineFlow
+from amf_vi.flows.planar import PlanarFlow
+from amf_vi.flows.radial import RadialFlow
 from data.data_generator import generate_data
 import numpy as np
 import os
@@ -19,21 +18,99 @@ class SequentialAMFVI(nn.Module):
         self.dim = dim
         
         if flow_types is None:
-            flow_types = ['realnvp', 'maf', 'iaf']
+            flow_types = ['realnvp', 'planar', 'radial']
         
         # Create flows
         self.flows = nn.ModuleList()
         for flow_type in flow_types:
             if flow_type == 'realnvp':
-                self.flows.append(RealNVPFlow(dim, n_layers=1))
-            elif flow_type == 'maf':
-                self.flows.append(MAFFlow(dim, n_layers=1))
-            elif flow_type == 'iaf':
-                self.flows.append(IAFFlow(dim, n_layers=1))
-
+                self.flows.append(RealNVPFlow(dim, n_layers=8))
+            elif flow_type == 'planar':
+                self.flows.append(PlanarFlow(dim, n_layers=32))
+            elif flow_type == 'radial':
+                self.flows.append(RadialFlow(dim, n_layers=32))
         
         # Track if flows are trained
         self.flows_trained = False
+    def compute_quality_scores(self, samples, target_data, method='mmd'):
+        """
+        Compute per-sample quality scores using MMD or likelihood-based metrics.
+        
+        Args:
+            samples: torch.Tensor [batch_size, dim] - samples to evaluate
+            target_data: torch.Tensor [n_target, dim] - reference target data
+            method: str - 'mmd', 'knn', or 'likelihood'
+        
+        Returns:
+            torch.Tensor [batch_size] - quality scores (higher = better)
+        """
+        if method == 'mmd':
+            return self._compute_mmd_scores(samples, target_data)
+        elif method == 'knn':
+            return self._compute_knn_scores(samples, target_data)
+        elif method == 'likelihood':
+            return self._compute_likelihood_scores(samples, target_data)
+        else:
+            raise ValueError(f"Unknown method: {method}")
+
+    def _compute_mmd_scores(self, samples, target_data, bandwidth=1.0):
+        """Compute MMD-based quality scores per sample."""
+        batch_size = samples.size(0)
+        n_target = target_data.size(0)
+        
+        # Expand for pairwise distance computation
+        samples_exp = samples.unsqueeze(1)  # [batch, 1, dim]
+        target_exp = target_data.unsqueeze(0)  # [1, n_target, dim]
+        
+        # Compute pairwise distances to target data
+        distances = torch.sum((samples_exp - target_exp) ** 2, dim=2)  # [batch, n_target]
+        
+        # RBF kernel with target data
+        kernel_target = torch.exp(-distances / (2 * bandwidth ** 2))
+        
+        # Average kernel values as quality score
+        quality_scores = kernel_target.mean(dim=1)  # [batch_size]
+        
+        return quality_scores
+
+    def _compute_knn_scores(self, samples, target_data, k=5):
+        """Compute k-NN based quality scores per sample."""
+        batch_size = samples.size(0)
+        
+        # Expand for pairwise distance computation
+        samples_exp = samples.unsqueeze(1)  # [batch, 1, dim]
+        target_exp = target_data.unsqueeze(0)  # [1, n_target, dim]
+        
+        # Compute distances to all target points
+        distances = torch.sum((samples_exp - target_exp) ** 2, dim=2)  # [batch, n_target]
+        
+        # Find k nearest neighbors and compute average distance
+        knn_distances, _ = torch.topk(distances, k, dim=1, largest=False)
+        avg_knn_distance = knn_distances.mean(dim=1)  # [batch_size]
+        
+        # Convert to quality score (lower distance = higher quality)
+        quality_scores = 1.0 / (1.0 + avg_knn_distance)
+        
+        return quality_scores
+
+    def _compute_likelihood_scores(self, samples, target_data):
+        """Compute likelihood-based quality scores using kernel density estimation."""
+        batch_size = samples.size(0)
+        bandwidth = 0.5  # Fixed bandwidth for simplicity
+        
+        # Expand for pairwise distance computation
+        samples_exp = samples.unsqueeze(1)  # [batch, 1, dim]
+        target_exp = target_data.unsqueeze(0)  # [1, n_target, dim]
+        
+        # Compute Gaussian kernel density estimate
+        distances = torch.sum((samples_exp - target_exp) ** 2, dim=2)  # [batch, n_target]
+        kernel_values = torch.exp(-distances / (2 * bandwidth ** 2))
+        
+        # Normalize and compute log-likelihood
+        density_estimates = kernel_values.mean(dim=1)  # [batch_size]
+        quality_scores = torch.log(density_estimates + 1e-8)
+        
+        return quality_scores
     
     def train_flows_independently(self, data, epochs=1000, lr=1e-4):
         """Stage 1: Train each flow independently."""
@@ -51,27 +128,12 @@ class SequentialAMFVI(nn.Module):
             for epoch in range(epochs):
                 optimizer.zero_grad()
                 
-                try:
-                    # Individual flow loss (negative log-likelihood)
-                    log_prob = flow.log_prob(data)
-                    loss = -log_prob.mean()
-                    
-                    # Check if loss requires grad
-                    if loss.requires_grad:
-                        loss.backward()
-                        optimizer.step()
-                    else:
-                        print(f"    Warning: Loss doesn't require grad at epoch {epoch}")
-                    
-                except RuntimeError as e:
-                    if "does not require grad" in str(e):
-                        print(f"    Skipping gradient step at epoch {epoch}: {e}")
-                        # Create a dummy loss for this step
-                        dummy_loss = torch.tensor(float('nan'), requires_grad=True)
-                        losses.append(dummy_loss.item())
-                        continue
-                    else:
-                        raise e
+                # Individual flow loss (negative log-likelihood)
+                log_prob = flow.log_prob(data)
+                loss = -log_prob.mean()
+                
+                loss.backward()
+                optimizer.step()
                 
                 losses.append(loss.item())
                 
@@ -143,6 +205,13 @@ class SequentialAMFVI(nn.Module):
         
         return torch.cat(all_samples, dim=0)
 
+    # Then use it like this:
+    def evaluate_sample_quality(self, samples, target_data):
+        """Evaluate quality of generated samples."""
+        with torch.no_grad():
+            quality_scores = self.compute_quality_scores(samples, target_data, method='mmd')
+            return quality_scores
+
 def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plots=False):
     """Train sequential AMF-VI with uniform weights."""
     
@@ -155,7 +224,7 @@ def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plo
     data = data.to(device)
     
     # Create sequential model
-    model = SequentialAMFVI(dim=2, flow_types=['realnvp', 'maf', 'iaf'])
+    model = SequentialAMFVI(dim=2, flow_types=['realnvp', 'planar', 'radial'])
     model = model.to(device)
     
     # Stage 1: Train flows independently
@@ -171,7 +240,7 @@ def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plo
         
         # Individual flow samples
         flow_samples = {}
-        flow_names = ['realnvp', 'maf', 'iaf']
+        flow_names = ['realnvp', 'planar', 'radial']
         for i, name in enumerate(flow_names):
             flow_samples[name] = model.flows[i].sample(1000)
         
@@ -198,14 +267,14 @@ def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plo
                 samples_np = samples.cpu().numpy()
                 axes[row, col].scatter(samples_np[:, 0], samples_np[:, 1], 
                                      alpha=0.6, c=colors[i], s=20)
-                axes[row, col].set_title(f'{name.upper()} Flow')
+                axes[row, col].set_title(f'{name.title()} Flow')
                 axes[row, col].grid(True, alpha=0.3)
         
         # Plot training losses (flow losses only)
         if flow_losses:
-            axes[1, 2].plot(flow_losses[0], label='Real-NVP', color='green', linewidth=2, alpha=0.7)
-            axes[1, 2].plot(flow_losses[1], label='MAF', color='orange', linewidth=2, alpha=0.7)
-            axes[1, 2].plot(flow_losses[2], label='IAF', color='purple', linewidth=2, alpha=0.7)
+            axes[1, 2].plot(flow_losses[0], label='Flow 1', color='green', linewidth=2, alpha=0.7)
+            axes[1, 2].plot(flow_losses[1], label='Flow 2', color='orange', linewidth=2, alpha=0.7)
+            axes[1, 2].plot(flow_losses[2], label='Flow 3', color='purple', linewidth=2, alpha=0.7)
         axes[1, 2].set_title('Individual Flow Training Losses')
         axes[1, 2].set_xlabel('Epoch')
         axes[1, 2].set_ylabel('Loss')
@@ -241,16 +310,7 @@ def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plo
         for i, (name, samples) in enumerate(flow_samples.items()):
             mean = samples.mean(dim=0).cpu().numpy()
             std = samples.std(dim=0).cpu().numpy()
-            print(f"{name.upper()}: Mean=[{mean[0]:.2f}, {mean[1]:.2f}], Std=[{std[0]:.2f}, {std[1]:.2f}]")
-        
-        # Model complexity analysis
-        print("\n🏗️ Model Architecture:")
-        total_params = 0
-        for i, flow in enumerate(model.flows):
-            n_params = sum(p.numel() for p in flow.parameters())
-            total_params += n_params
-            print(f"{flow_names[i].upper()}: {n_params:,} parameters")
-        print(f"Total parameters: {total_params:,}")
+            print(f"{name.capitalize()}: Mean=[{mean[0]:.2f}, {mean[1]:.2f}], Std=[{std[0]:.2f}, {std[1]:.2f}]")
     
     # Save trained model
     results_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'results')

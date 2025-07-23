@@ -12,11 +12,13 @@ import os
 import pickle
 
 class SequentialAMFVI(nn.Module):
-    """Sequential training version of AMF-VI with meta-learner weights."""
+    """Sequential training version of AMF-VI with quality-aware meta-learner weights."""
     
-    def __init__(self, dim=2, flow_types=None):
+    def __init__(self, dim=2, flow_types=None, temperature=1.0, quality_weight=0.1):
         super().__init__()
         self.dim = dim
+        self.temperature = temperature  # Temperature for softmax weighting
+        self.quality_weight = quality_weight  # Weight for quality-based reweighting
         
         if flow_types is None:
             flow_types = ['realnvp', 'maf', 'iaf']
@@ -31,10 +33,9 @@ class SequentialAMFVI(nn.Module):
             elif flow_type == 'iaf':
                 self.flows.append(IAFFlow(dim, n_layers=1))
 
-        
-        # Meta-learner for adaptive weights
+        # Meta-learner for adaptive weights with quality awareness
         self.meta_learner = nn.Sequential(
-            nn.Linear(dim + len(self.flows), 64),  # input + flow predictions
+            nn.Linear(dim + len(self.flows) + 1, 64),  # +1 for quality score
             nn.ReLU(),
             nn.Linear(64, 32),
             nn.ReLU(),
@@ -45,6 +46,57 @@ class SequentialAMFVI(nn.Module):
         # Track training stages
         self.flows_trained = False
         self.meta_trained = False
+        
+        # Store flow quality scores for dynamic reweighting
+        self.flow_quality_scores = torch.ones(len(self.flows))
+    
+    def compute_quality_scores(self, data, per_sample=False):
+        """
+        Compute quality scores for each flow based on data fit.
+        
+        Args:
+            data: Input data tensor
+            per_sample: If True, return per-sample quality scores
+        
+        Returns:
+            quality_scores: Tensor of shape [n_flows] or [batch_size, n_flows]
+        """
+        if not self.flows_trained:
+            if per_sample:
+                return torch.ones(data.size(0), len(self.flows), device=data.device)
+            return torch.ones(len(self.flows), device=data.device)
+        
+        quality_scores = []
+        
+        for flow in self.flows:
+            flow.eval()
+            with torch.no_grad():
+                log_prob = flow.log_prob(data)
+                
+                if per_sample:
+                    # Per-sample quality: use log probability directly
+                    quality = log_prob
+                else:
+                    # Global quality: use mean log probability
+                    quality = log_prob.mean()
+                
+                quality_scores.append(quality.unsqueeze(-1) if per_sample else quality)
+        
+        if per_sample:
+            quality_scores = torch.cat(quality_scores, dim=1)  # [batch_size, n_flows]
+        else:
+            quality_scores = torch.stack(quality_scores)  # [n_flows]
+        
+        # Normalize quality scores using temperature-scaled softmax
+        quality_scores = torch.softmax(quality_scores / self.temperature, dim=-1)
+        
+        return quality_scores
+    
+    def update_flow_quality_scores(self, data):
+        """Update global flow quality scores based on current data."""
+        if self.flows_trained:
+            self.flow_quality_scores = self.compute_quality_scores(data, per_sample=False)
+            print(f"📊 Updated flow quality scores: {[f'{score:.3f}' for score in self.flow_quality_scores.cpu().numpy()]}")
     
     def train_flows_independently(self, data, epochs=1000, lr=1e-4):
         """Stage 1: Train each flow independently."""
@@ -93,11 +145,15 @@ class SequentialAMFVI(nn.Module):
             print(f"    Final loss: {losses[-1]:.4f}")
         
         self.flows_trained = True
+        
+        # Update quality scores after training
+        self.update_flow_quality_scores(data)
+        
         return flow_losses
     
     def train_meta_learner(self, data, epochs=300, lr=1e-3):
-        """Stage 2: Train meta-learner to learn adaptive weights (flows frozen)."""
-        print("🔄 Stage 2: Training meta-learner...")
+        """Stage 2: Train meta-learner to learn adaptive weights with quality awareness."""
+        print("🔄 Stage 2: Training quality-aware meta-learner...")
         
         if not self.flows_trained:
             raise RuntimeError("Flows must be trained first!")
@@ -107,11 +163,15 @@ class SequentialAMFVI(nn.Module):
             for param in flow.parameters():
                 param.requires_grad = False
         
-        # Get flow predictions (fixed)
+        # Get flow predictions and quality scores
         flow_predictions = self.get_flow_predictions(data)
+        per_sample_quality = self.compute_quality_scores(data, per_sample=True)
         
-        # Create input for meta-learner: [x, flow_predictions]
-        meta_input = torch.cat([data, flow_predictions], dim=1)
+        # Average quality score per sample (used as additional input)
+        avg_quality_per_sample = per_sample_quality.mean(dim=1, keepdim=True)
+        
+        # Create input for meta-learner: [x, flow_predictions, avg_quality]
+        meta_input = torch.cat([data, flow_predictions, avg_quality_per_sample], dim=1)
         
         # Train meta-learner only
         optimizer = optim.Adam(self.meta_learner.parameters(), lr=lr)
@@ -123,12 +183,21 @@ class SequentialAMFVI(nn.Module):
             # Get adaptive weights from meta-learner
             weights = self.meta_learner(meta_input)
             
+            # Apply quality-aware reweighting
+            quality_weighted = weights * per_sample_quality
+            normalized_weights = quality_weighted / (quality_weighted.sum(dim=1, keepdim=True) + 1e-8)
+            
             # Compute weighted mixture log probability
-            weighted_log_probs = flow_predictions + torch.log(weights + 1e-8)
+            weighted_log_probs = flow_predictions + torch.log(normalized_weights + 1e-8)
             mixture_log_prob = torch.logsumexp(weighted_log_probs, dim=1)
             
-            # Meta-learner loss (negative log-likelihood)
-            loss = -mixture_log_prob.mean()
+            # Meta-learner loss with quality regularization
+            base_loss = -mixture_log_prob.mean()
+            
+            # Quality regularization: encourage using higher quality flows
+            quality_reg = -self.quality_weight * (normalized_weights * per_sample_quality).sum(dim=1).mean()
+            
+            loss = base_loss + quality_reg
             
             loss.backward()
             optimizer.step()
@@ -136,7 +205,7 @@ class SequentialAMFVI(nn.Module):
             losses.append(loss.item())
             
             if epoch % 50 == 0:
-                print(f"  Epoch {epoch}: Loss = {loss.item():.4f}")
+                print(f"  Epoch {epoch}: Loss = {loss.item():.4f} (Base: {base_loss.item():.4f}, Quality: {quality_reg.item():.4f})")
         
         print(f"  Final loss: {losses[-1]:.4f}")
         self.meta_trained = True
@@ -157,7 +226,7 @@ class SequentialAMFVI(nn.Module):
         return torch.cat(flow_log_probs, dim=1)  # [batch, n_flows]
     
     def forward(self, x):
-        """Forward pass with adaptive meta-learner weights."""
+        """Forward pass with quality-aware adaptive meta-learner weights."""
         if not self.flows_trained:
             raise RuntimeError("Model must be trained first!")
         
@@ -165,26 +234,34 @@ class SequentialAMFVI(nn.Module):
         flow_predictions = self.get_flow_predictions(x)
         
         if self.meta_trained:
-            # Use meta-learner for adaptive weights
-            meta_input = torch.cat([x, flow_predictions], dim=1)
+            # Use meta-learner for adaptive weights with quality awareness
+            per_sample_quality = self.compute_quality_scores(x, per_sample=True)
+            avg_quality_per_sample = per_sample_quality.mean(dim=1, keepdim=True)
+            
+            meta_input = torch.cat([x, flow_predictions, avg_quality_per_sample], dim=1)
             weights = self.meta_learner(meta_input)
+            
+            # Apply quality-aware reweighting
+            quality_weighted = weights * per_sample_quality
+            final_weights = quality_weighted / (quality_weighted.sum(dim=1, keepdim=True) + 1e-8)
         else:
             # Fall back to uniform weights
             batch_size = x.size(0)
-            weights = torch.ones(batch_size, len(self.flows), device=x.device) / len(self.flows)
+            final_weights = torch.ones(batch_size, len(self.flows), device=x.device) / len(self.flows)
         
         # Compute mixture log probability
-        weighted_log_probs = flow_predictions + torch.log(weights + 1e-8)
+        weighted_log_probs = flow_predictions + torch.log(final_weights + 1e-8)
         mixture_log_prob = torch.logsumexp(weighted_log_probs, dim=1)
         
         return {
             'log_prob': flow_predictions,
-            'weights': weights,
+            'weights': final_weights,
             'mixture_log_prob': mixture_log_prob,
+            'quality_scores': per_sample_quality if self.meta_trained else None,
         }
     
     def sample(self, n_samples):
-        """Sample from the mixture using adaptive weights when available."""
+        """Sample from the mixture using quality-aware adaptive weights."""
         device = next(self.parameters()).device
         
         if not self.meta_trained:
@@ -192,34 +269,35 @@ class SequentialAMFVI(nn.Module):
             print("⚠️  Meta-learner not trained, using uniform sampling")
             return self._uniform_sample(n_samples)
         
-        # Adaptive sampling using meta-learner weights
-        print("🎯 Using adaptive sampling with meta-learner weights")
+        # Adaptive sampling using quality-aware meta-learner weights
+        print("🎯 Using quality-aware adaptive sampling")
         
         # Generate a grid of sample points to estimate adaptive weights
-        # This gives us a representative distribution of where to sample from
-        n_grid = min(500, n_samples)  # Use smaller grid for efficiency
+        n_grid = min(500, n_samples)
         
         # Sample uniformly in a reasonable range to estimate weight distribution
-        grid_range = 3.0  # Adjust based on your data range
+        grid_range = 3.0
         grid_x = torch.linspace(-grid_range, grid_range, int(np.sqrt(n_grid)), device=device)
         grid_y = torch.linspace(-grid_range, grid_range, int(np.sqrt(n_grid)), device=device)
         grid_xx, grid_yy = torch.meshgrid(grid_x, grid_y, indexing='ij')
         grid_points = torch.stack([grid_xx.flatten(), grid_yy.flatten()], dim=1)[:n_grid]
         
-        # Get adaptive weights for grid points
+        # Get quality-aware adaptive weights for grid points
         self.eval()
         with torch.no_grad():
-            flow_predictions = self.get_flow_predictions(grid_points)
-            meta_input = torch.cat([grid_points, flow_predictions], dim=1)
-            grid_weights = self.meta_learner(meta_input)  # [n_grid, n_flows]
+            output = self.forward(grid_points)
+            grid_weights = output['weights']  # [n_grid, n_flows]
         
-        # Compute average weights across the grid as sampling probabilities
-        avg_weights = grid_weights.mean(dim=0)  # [n_flows]
+        # Compute quality-weighted average weights
+        quality_scores = self.compute_quality_scores(grid_points, per_sample=True)
+        quality_weighted = grid_weights * quality_scores
+        avg_weights = quality_weighted.mean(dim=0)  # [n_flows]
+        avg_weights = avg_weights / (avg_weights.sum() + 1e-8)  # Normalize
         
-        # Sample from each flow according to adaptive weights
+        # Sample from each flow according to quality-aware adaptive weights
         all_samples = []
         for i, flow in enumerate(self.flows):
-            # Number of samples for this flow based on adaptive weight
+            # Number of samples for this flow based on quality-aware weight
             n_flow_samples = int(np.round(avg_weights[i].item() * n_samples))
             
             if n_flow_samples > 0:
@@ -254,7 +332,8 @@ class SequentialAMFVI(nn.Module):
         perm = torch.randperm(final_samples.size(0), device=device)
         final_samples = final_samples[perm]
         
-        print(f"📊 Adaptive sampling weights: {[f'{w:.3f}' for w in avg_weights.cpu().numpy()]}")
+        print(f"📊 Quality-aware sampling weights: {[f'{w:.3f}' for w in avg_weights.cpu().numpy()]}")
+        print(f"🏆 Flow quality scores: {[f'{score:.3f}' for score in self.flow_quality_scores.cpu().numpy()]}")
         
         return final_samples[:n_samples]  # Ensure exact count
     
@@ -281,10 +360,12 @@ class SequentialAMFVI(nn.Module):
         
         return torch.cat(all_samples, dim=0)
 
-def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plots=False):
-    """Train sequential AMF-VI with meta-learner weights."""
+
+def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plots=False, temperature=1.0, quality_weight=0.1):
+    """Train sequential AMF-VI with quality-aware meta-learner weights."""
     
-    print(f"🚀 Sequential AMF-VI with Meta-Learner on {dataset_name}")
+    print(f"🚀 Quality-Aware Sequential AMF-VI on {dataset_name}")
+    print(f"🌡️  Temperature: {temperature}, Quality Weight: {quality_weight}")
     print("=" * 60)
     
     # Generate data
@@ -292,14 +373,19 @@ def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plo
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     data = data.to(device)
     
-    # Create sequential model
-    model = SequentialAMFVI(dim=2, flow_types=['realnvp', 'maf', 'iaf'])
+    # Create sequential model with quality awareness
+    model = SequentialAMFVI(
+        dim=2, 
+        flow_types=['realnvp', 'maf', 'iaf'],
+        temperature=temperature,
+        quality_weight=quality_weight
+    )
     model = model.to(device)
     
     # Stage 1: Train flows independently
     flow_losses = model.train_flows_independently(data, epochs=200, lr=1e-3)
     
-    # Stage 2: Train meta-learner
+    # Stage 2: Train quality-aware meta-learner
     meta_losses = model.train_meta_learner(data, epochs=200, lr=1e-3)
     
     # Evaluation and visualization
@@ -307,7 +393,7 @@ def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plo
     
     model.eval()
     with torch.no_grad():
-        # Generate samples using adaptive sampling
+        # Generate samples using quality-aware adaptive sampling
         model_samples = model.sample(1000)
         
         # Individual flow samples for comparison
@@ -316,7 +402,7 @@ def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plo
         for i, name in enumerate(flow_names):
             flow_samples[name] = model.flows[i].sample(1000)
         
-        # Get sample weights to analyze meta-learner behavior
+        # Get sample weights and quality analysis
         sample_output = model.forward(data[:100])  # First 100 samples
         avg_weights = sample_output['weights'].mean(dim=0).cpu().numpy()
         
@@ -329,10 +415,10 @@ def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plo
         axes[0, 0].set_title('Target Data')
         axes[0, 0].grid(True, alpha=0.3)
         
-        # Plot sequential model samples (with adaptive sampling)
+        # Plot quality-aware model samples
         model_np = model_samples.cpu().numpy()
         axes[0, 1].scatter(model_np[:, 0], model_np[:, 1], alpha=0.6, c='red', s=20)
-        axes[0, 1].set_title('Adaptive AMF-VI Samples')
+        axes[0, 1].set_title('Quality-Aware AMF-VI Samples')
         axes[0, 1].grid(True, alpha=0.3)
         
         # Plot individual flows
@@ -343,12 +429,13 @@ def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plo
                 samples_np = samples.cpu().numpy()
                 axes[row, col].scatter(samples_np[:, 0], samples_np[:, 1], 
                                      alpha=0.6, c=colors[i], s=20)
-                axes[row, col].set_title(f'{name.upper()} Flow')
+                quality_score = model.flow_quality_scores[i].item()
+                axes[row, col].set_title(f'{name.upper()} Flow (Q: {quality_score:.3f})')
                 axes[row, col].grid(True, alpha=0.3)
         
         # Plot meta-learner training loss
         if meta_losses:
-            axes[1, 2].plot(meta_losses, label='Meta-Learner', color='red', linewidth=2)
+            axes[1, 2].plot(meta_losses, label='Quality-Aware Meta-Learner', color='red', linewidth=2)
             axes[1, 2].set_title('Meta-Learner Training Loss')
             axes[1, 2].set_xlabel('Epoch')
             axes[1, 2].set_ylabel('Loss')
@@ -356,13 +443,13 @@ def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plo
             axes[1, 2].legend()
         
         plt.tight_layout()
-        plt.suptitle(f'Sequential AMF-VI with Adaptive Sampling - {dataset_name.title()}', fontsize=16)
+        plt.suptitle(f'Quality-Aware Sequential AMF-VI - {dataset_name.title()}', fontsize=16)
         
         # Save plot if requested
         if save_plots:
             results_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'results')
             os.makedirs(results_dir, exist_ok=True)
-            plot_path = os.path.join(results_dir, f'sequential_amf_vi_adaptive_results_{dataset_name}.png')
+            plot_path = os.path.join(results_dir, f'quality_aware_amf_vi_results_{dataset_name}.png')
             fig.savefig(plot_path, dpi=300, bbox_inches='tight')
             print(f"✅ Plot saved to {plot_path}")
         
@@ -375,21 +462,24 @@ def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plo
         # Print analysis
         print("\n📊 Analysis:")
         print(f"Target data mean: {data.mean(dim=0).cpu().numpy()}")
-        print(f"Adaptive model mean: {model_samples.mean(dim=0).cpu().numpy()}")
+        print(f"Quality-aware model mean: {model_samples.mean(dim=0).cpu().numpy()}")
         print(f"Target data std: {data.std(dim=0).cpu().numpy()}")
-        print(f"Adaptive model std: {model_samples.std(dim=0).cpu().numpy()}")
+        print(f"Quality-aware model std: {model_samples.std(dim=0).cpu().numpy()}")
         
-        # Meta-learner weight analysis
-        print(f"\n🧠 Meta-Learner Weight Analysis:")
+        # Quality-aware meta-learner analysis
+        print(f"\n🧠 Quality-Aware Meta-Learner Analysis:")
         for i, name in enumerate(flow_names):
-            print(f"{name.upper()} average weight: {avg_weights[i]:.3f}")
+            weight = avg_weights[i]
+            quality = model.flow_quality_scores[i].item()
+            print(f"{name.upper()}: Weight={weight:.3f}, Quality={quality:.3f}, QxW={weight*quality:.3f}")
         
-        # Check flow diversity
+        # Check flow specialization
         print("\n🔍 Flow Specialization Analysis:")
         for i, (name, samples) in enumerate(flow_samples.items()):
             mean = samples.mean(dim=0).cpu().numpy()
             std = samples.std(dim=0).cpu().numpy()
-            print(f"{name.upper()}: Mean=[{mean[0]:.2f}, {mean[1]:.2f}], Std=[{std[0]:.2f}, {std[1]:.2f}]")
+            quality = model.flow_quality_scores[i].item()
+            print(f"{name.upper()}: Mean=[{mean[0]:.2f}, {mean[1]:.2f}], Std=[{std[0]:.2f}, {std[1]:.2f}], Quality={quality:.3f}")
         
         # Model complexity analysis
         print("\n🏗️ Model Architecture:")
@@ -402,36 +492,48 @@ def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plo
         # Meta-learner parameters
         meta_params = sum(p.numel() for p in model.meta_learner.parameters())
         total_params += meta_params
-        print(f"META-LEARNER: {meta_params:,} parameters")
+        print(f"QUALITY-AWARE META-LEARNER: {meta_params:,} parameters")
         print(f"Total parameters: {total_params:,}")
     
     # Save trained model
     results_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'results')
     os.makedirs(results_dir, exist_ok=True)
-    model_path = os.path.join(results_dir, f'trained_model_adaptive_{dataset_name}.pkl')
+    model_path = os.path.join(results_dir, f'trained_model_quality_aware_{dataset_name}.pkl')
     
     with open(model_path, 'wb') as f:
         pickle.dump({
             'model': model, 
             'flow_losses': flow_losses,
             'meta_losses': meta_losses,
-            'dataset': dataset_name
+            'dataset': dataset_name,
+            'temperature': temperature,
+            'quality_weight': quality_weight
         }, f)
     print(f"✅ Model saved to {model_path}")
     
     return model, flow_losses, meta_losses
 
+
 if __name__ == "__main__":
-    # Run the sequential AMF-VI experiment on multiple datasets
+    # Run the quality-aware sequential AMF-VI experiment on multiple datasets
     datasets = ['banana', 'x_shape', 'bimodal_shared', 'bimodal_different']
     
+    # Test different temperature and quality weight settings
+    temperature_settings = [0.5, 1.0, 2.0]
+    quality_weight_settings = [0.0, 0.1, 0.3]
+    
     for dataset_name in datasets:
-        print(f"\n{'='*60}")
-        print(f"Training on dataset: {dataset_name.upper()}")
-        print(f"{'='*60}")
-        
-        model, flow_losses, meta_losses = train_sequential_amf_vi(
-            dataset_name, 
-            show_plots=False, 
-            save_plots=True
-        )
+        for temp in temperature_settings:
+            for quality_w in quality_weight_settings:
+                print(f"\n{'='*80}")
+                print(f"Training on dataset: {dataset_name.upper()}")
+                print(f"Temperature: {temp}, Quality Weight: {quality_w}")
+                print(f"{'='*80}")
+                
+                model, flow_losses, meta_losses = train_sequential_amf_vi(
+                    dataset_name, 
+                    show_plots=False, 
+                    save_plots=True,
+                    temperature=temp,
+                    quality_weight=quality_w
+                )
