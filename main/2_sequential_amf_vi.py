@@ -5,11 +5,14 @@ import matplotlib.pyplot as plt
 from amf_vi.flows.realnvp import RealNVPFlow
 from amf_vi.flows.maf import MAFFlow
 from amf_vi.flows.iaf import IAFFlow
-from amf_vi.flows.spline import SplineFlow
 from data.data_generator import generate_data
 import numpy as np
 import os
 import pickle
+
+# Set seeds for reproducibility
+torch.manual_seed(42)
+np.random.seed(42)
 
 class SequentialAMFVI(nn.Module):
     """Sequential training version of AMF-VI with uniform weights."""
@@ -21,15 +24,17 @@ class SequentialAMFVI(nn.Module):
         if flow_types is None:
             flow_types = ['realnvp', 'maf', 'iaf']
         
+        self.flow_types = flow_types  # Store flow types for later reference
+        
         # Create flows
         self.flows = nn.ModuleList()
         for flow_type in flow_types:
             if flow_type == 'realnvp':
-                self.flows.append(RealNVPFlow(dim, n_layers=1))
+                self.flows.append(RealNVPFlow(dim, n_layers=8))
             elif flow_type == 'maf':
-                self.flows.append(MAFFlow(dim, n_layers=1))
+                self.flows.append(MAFFlow(dim, n_layers=8))
             elif flow_type == 'iaf':
-                self.flows.append(IAFFlow(dim, n_layers=1))
+                self.flows.append(IAFFlow(dim, n_layers=8))
 
         
         # Track if flows are trained
@@ -169,13 +174,13 @@ def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plo
         # Generate samples
         model_samples = model.sample(1000)
         
-        # Individual flow samples
+        # Individual flow samples - use actual flow types from model
         flow_samples = {}
-        flow_names = ['realnvp', 'maf', 'iaf']
-        for i, name in enumerate(flow_names):
-            flow_samples[name] = model.flows[i].sample(1000)
+        for i, flow_type in enumerate(model.flow_types):
+            flow_samples[flow_type] = model.flows[i].sample(1000)
         
         # Create visualization
+        n_flows = len(model.flows)
         fig, axes = plt.subplots(2, 3, figsize=(15, 10))
         
         # Plot target data
@@ -192,25 +197,31 @@ def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plo
         
         # Plot individual flows
         colors = ['green', 'orange', 'purple']
-        for i, (name, samples) in enumerate(flow_samples.items()):
-            if i < 3:
-                row, col = (0, 2) if i == 0 else (1, i-1)
+        positions = [(0, 2), (1, 0), (1, 1)]  # positions for up to 3 flows
+        
+        for i, (flow_type, samples) in enumerate(flow_samples.items()):
+            if i < len(positions):
+                row, col = positions[i]
                 samples_np = samples.cpu().numpy()
                 axes[row, col].scatter(samples_np[:, 0], samples_np[:, 1], 
                                      alpha=0.6, c=colors[i], s=20)
-                axes[row, col].set_title(f'{name.upper()} Flow')
+                axes[row, col].set_title(f'{flow_type.upper()} Flow')
                 axes[row, col].grid(True, alpha=0.3)
         
-        # Plot training losses (flow losses only)
+        # Hide unused subplot if only 2 flows
+        if n_flows == 2:
+            axes[1, 2].axis('off')
+        
+        # Plot training losses
         if flow_losses:
-            axes[1, 2].plot(flow_losses[0], label='Real-NVP', color='green', linewidth=2, alpha=0.7)
-            axes[1, 2].plot(flow_losses[1], label='MAF', color='orange', linewidth=2, alpha=0.7)
-            axes[1, 2].plot(flow_losses[2], label='IAF', color='purple', linewidth=2, alpha=0.7)
-        axes[1, 2].set_title('Individual Flow Training Losses')
-        axes[1, 2].set_xlabel('Epoch')
-        axes[1, 2].set_ylabel('Loss')
-        axes[1, 2].grid(True, alpha=0.3)
-        axes[1, 2].legend()
+            ax_loss = axes[1, 2] if n_flows > 2 else axes[1, 1]
+            for i, (flow_type, losses) in enumerate(zip(model.flow_types, flow_losses)):
+                ax_loss.plot(losses, label=flow_type.upper(), color=colors[i], linewidth=2, alpha=0.7)
+            ax_loss.set_title('Individual Flow Training Losses')
+            ax_loss.set_xlabel('Epoch')
+            ax_loss.set_ylabel('Loss')
+            ax_loss.grid(True, alpha=0.3)
+            ax_loss.legend()
         
         plt.tight_layout()
         plt.suptitle(f'Sequential AMF-VI Results - {dataset_name.title()}', fontsize=16)
@@ -238,10 +249,10 @@ def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plo
         
         # Check flow diversity
         print("\n🔍 Flow Specialization Analysis:")
-        for i, (name, samples) in enumerate(flow_samples.items()):
+        for flow_type, samples in flow_samples.items():
             mean = samples.mean(dim=0).cpu().numpy()
             std = samples.std(dim=0).cpu().numpy()
-            print(f"{name.upper()}: Mean=[{mean[0]:.2f}, {mean[1]:.2f}], Std=[{std[0]:.2f}, {std[1]:.2f}]")
+            print(f"{flow_type.upper()}: Mean=[{mean[0]:.2f}, {mean[1]:.2f}], Std=[{std[0]:.2f}, {std[1]:.2f}]")
         
         # Model complexity analysis
         print("\n🏗️ Model Architecture:")
@@ -249,7 +260,7 @@ def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plo
         for i, flow in enumerate(model.flows):
             n_params = sum(p.numel() for p in flow.parameters())
             total_params += n_params
-            print(f"{flow_names[i].upper()}: {n_params:,} parameters")
+            print(f"{model.flow_types[i].upper()}: {n_params:,} parameters")
         print(f"Total parameters: {total_params:,}")
     
     # Save trained model

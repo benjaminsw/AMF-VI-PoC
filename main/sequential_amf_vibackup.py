@@ -155,7 +155,7 @@ def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plo
     data = data.to(device)
     
     # Create sequential model
-    model = SequentialAMFVI(dim=2, flow_types=['realnvp', 'maf'])#, 'iaf'])
+    model = SequentialAMFVI(dim=2, flow_types=['realnvp', 'maf', 'iaf'])
     model = model.to(device)
     
     # Stage 1: Train flows independently

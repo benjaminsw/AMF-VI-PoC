@@ -4,7 +4,6 @@ from .planar import PlanarFlow
 from .radial import RadialFlow
 from .maf import MAFFlow
 from .iaf import IAFFlow
-from .spline import SplineFlow
 
 __all__ = [
     'BaseFlow',
@@ -13,5 +12,5 @@ __all__ = [
     'RadialFlow',
     'MAFFlow',
     'IAFFlow',
-    'SplineFlow'
+
 ]
