@@ -1,0 +1,27 @@
+# Weight Learning Configuration
+method: 'log_likelihood'  # 'log_likelihood', 'gradient', 'performance'
+strategy: 'direct_likelihood'  # 'direct_likelihood', 'cross_validation', 'annealed'
+scheduler: 'exponential_decay'  # 'fixed', 'exponential_decay', 'cosine_annealing'
+
+# Method-specific parameters
+likelihood_params:
+  base_samples: 1000
+  evaluation_frequency: 10
+
+gradient_params:
+  lr: 0.01
+  optimizer: 'adam'
+
+# Strategy-specific parameters
+strategy_params:
+  smoothing_factor: 0.1
+
+# Scheduler-specific parameters
+scheduler_params:
+  initial_lr: 0.01
+  decay_rate: 0.95
+
+# Training parameters
+training_params:
+  weight_epochs: 300
+  update_frequency: 10
