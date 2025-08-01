@@ -11,12 +11,18 @@ import numpy as np
 import os
 import pickle
 
+# Set seed for reproducible experiments
+torch.manual_seed(2025)
+np.random.seed(2025)
+
 class SequentialAMFVI(nn.Module):
     """Sequential training version of AMF-VI with learnable weights."""
     
-    def __init__(self, dim=2, flow_types=None, weight_update_method='log_likelihood'):
+    def __init__(self, dim=2, flow_types=None, weight_update_method='moving_average'):
         super().__init__()
         self.dim = dim
+        # Store dataset name for fresh data generation during weight learning
+        self.dataset_name = dataset_name 
         
         if flow_types is None:
             flow_types = ['realnvp', 'maf']
@@ -31,11 +37,12 @@ class SequentialAMFVI(nn.Module):
             elif flow_type == 'iaf':
                 self.flows.append(IAFFlow(dim, n_layers=1))
         
-        # NEW: Learnable mixing weights (in log space for numerical stability)
-        self.log_weights = nn.Parameter(torch.zeros(len(self.flows)))
+        # Initialize weights as parameters (not log_weights for moving average)
+        self.weights = nn.Parameter(torch.ones(len(self.flows)) / len(self.flows))
         self.weight_update_method = weight_update_method
         
-        # For likelihood-based updates
+        # Moving average parameters
+        self.alpha = 0.9  # Moving average decay factor
         self.weight_lr = 0.01
         self.weight_history = []
         
@@ -92,52 +99,60 @@ class SequentialAMFVI(nn.Module):
         self.flows_trained = True
         return flow_losses
     
-    def train_mixture_weights(self, data, epochs=500, method='log_likelihood'):
-        """Stage 2: Learn optimal mixing weights based on flow performance."""
+    def train_mixture_weights_moving_average(self, data, epochs=500):
+        """Stage 2: Learn weights using Moving Average of Likelihoods."""
         if not self.flows_trained:
             raise RuntimeError("Flows must be trained first!")
         
-        print("🔄 Stage 2: Learning mixture weights...")
+        print("🔄 Stage 2: Learning mixture weights (Moving Average)...")
         
-        # Create optimizer for weights only
-        weight_optimizer = optim.Adam([self.log_weights], lr=self.weight_lr)
         weight_losses = []
         
         for epoch in range(epochs):
-            weight_optimizer.zero_grad()
+            # Generate fresh data for each epoch to avoid bias
+            dataset_name = getattr(self, 'dataset_name', 'multimodal')  # Default fallback
+            fresh_data = generate_data(dataset_name, n_samples=1000)
+            fresh_data = fresh_data.to(data.device)
             
-            # Get flow predictions
+            # Get flow log probabilities on fresh data
             flow_log_probs = []
             for flow in self.flows:
                 flow.eval()
                 with torch.no_grad():
+                    log_prob = flow.log_prob(fresh_data)
+                    flow_log_probs.append(log_prob.mean().item())  # Average over batch
+            
+            # Convert to likelihoods and normalize (softmax)
+            flow_log_probs_tensor = torch.tensor(flow_log_probs)
+            normalized_likelihoods = F.softmax(flow_log_probs_tensor, dim=0)
+            
+            # Moving average update: weight_i = α * old_weight_i + (1-α) * normalized_likelihood_i
+            with torch.no_grad():
+                old_weights = self.weights.data.clone()
+                new_weights = self.alpha * old_weights + (1 - self.alpha) * normalized_likelihoods
+                self.weights.data = new_weights
+            
+            # Compute mixture log probability for loss tracking (use original data for consistency)
+            batch_weights = self.weights.unsqueeze(0).expand(data.size(0), -1)
+            flow_predictions = []
+            for flow in self.flows:
+                flow.eval()
+                with torch.no_grad():
                     log_prob = flow.log_prob(data)
-                    flow_log_probs.append(log_prob.unsqueeze(1))
+                    flow_predictions.append(log_prob.unsqueeze(1))
             
-            flow_predictions = torch.cat(flow_log_probs, dim=1)  # [batch, n_flows]
-            
-            # Compute current weights
-            weights = F.softmax(self.log_weights, dim=0)
-            batch_weights = weights.unsqueeze(0).expand(data.size(0), -1)
-            
-            # Compute mixture log probability
+            flow_predictions = torch.cat(flow_predictions, dim=1)
             weighted_log_probs = flow_predictions + torch.log(batch_weights + 1e-8)
             mixture_log_prob = torch.logsumexp(weighted_log_probs, dim=1)
-            
-            # Loss is negative log-likelihood of the mixture
             loss = -mixture_log_prob.mean()
-            
-            # Backward and optimize
-            loss.backward()
-            weight_optimizer.step()
             
             weight_losses.append(loss.item())
             
             if epoch % 100 == 0:
-                current_weights = F.softmax(self.log_weights, dim=0).detach().cpu().numpy()
+                current_weights = self.weights.detach().cpu().numpy()
                 print(f"    Epoch {epoch}: Loss = {loss.item():.4f}, Weights = {current_weights}")
         
-        final_weights = F.softmax(self.log_weights, dim=0).detach().cpu().numpy()
+        final_weights = self.weights.detach().cpu().numpy()
         print(f"    Final weights: {final_weights}")
         
         self.weights_trained = True
@@ -168,7 +183,7 @@ class SequentialAMFVI(nn.Module):
         
         # Use learned weights if available, otherwise uniform
         if self.weights_trained:
-            weights = F.softmax(self.log_weights, dim=0)
+            weights = self.weights
         else:
             weights = torch.ones(len(self.flows), device=x.device) / len(self.flows)
         
@@ -185,13 +200,17 @@ class SequentialAMFVI(nn.Module):
             'mixture_log_prob': mixture_log_prob,
         }
     
+    def log_prob(self, x):
+        """Compute log probability of data under the mixture model."""
+        return self.forward(x)['mixture_log_prob']
+    
     def sample(self, n_samples):
         """Sample from the mixture with learned or uniform weights."""
         device = next(self.parameters()).device
         
         # Get current weights
         if self.weights_trained:
-            weights = F.softmax(self.log_weights, dim=0).detach().cpu().numpy()
+            weights = self.weights.detach().cpu().numpy()
         else:
             weights = np.ones(len(self.flows)) / len(self.flows)
         
@@ -221,15 +240,16 @@ def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plo
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     data = data.to(device)
     
-    # Create sequential model
-    model = SequentialAMFVI(dim=2, flow_types=['realnvp', 'maf'])
+    # Create sequential model with moving average weight updates
+    model = SequentialAMFVI(dim=2, flow_types=['realnvp', 'maf'], weight_update_method='moving_average')
+    model.dataset_name = dataset_name  # Set dataset name for fresh data generation
     model = model.to(device)
     
     # Stage 1: Train flows independently
-    flow_losses = model.train_flows_independently(data, epochs=200, lr=1e-3)
+    flow_losses = model.train_flows_independently(data, epochs=500, lr=1e-3)
     
-    # Stage 2: Learn mixture weights
-    weight_losses = model.train_mixture_weights(data, epochs=300)
+    # Stage 2: Learn mixture weights using moving average (simplified call)
+    weight_losses = model.train_mixture_weights_moving_average(data, epochs=500)
     
     # Evaluation and visualization
     print("\n🎨 Generating visualizations...")
@@ -246,51 +266,76 @@ def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plo
             flow_samples[name] = model.flows[i].sample(1000)
         
         # Create visualization
-        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-        
-        # Plot target data
+        # Change subplot creation from 2x2 to 2x3
+        fig, axes = plt.subplots(2, 3, figsize=(18, 8))
+
+        # Plot target data (unchanged)
         data_np = data.cpu().numpy()
         axes[0, 0].scatter(data_np[:, 0], data_np[:, 1], alpha=0.6, c='blue', s=20)
         axes[0, 0].set_title('Target Data')
         axes[0, 0].grid(True, alpha=0.3)
-        
-        # Plot sequential model samples
+
+        # Plot sequential model samples (unchanged)
         model_np = model_samples.cpu().numpy()
         axes[0, 1].scatter(model_np[:, 0], model_np[:, 1], alpha=0.6, c='red', s=20)
-        axes[0, 1].set_title('Sequential AMF-VI Samples (Learned Weights)')
+        axes[0, 1].set_title('Sequential AMF-VI Samples (Moving Avg Weights)')
         axes[0, 1].grid(True, alpha=0.3)
-        
-        # Plot individual flows
+
+        # Plot individual flows (unchanged - still uses bottom row positions 0,1)
         colors = ['green', 'orange']
         for i, (name, samples) in enumerate(flow_samples.items()):
             row, col = (1, i)
             samples_np = samples.cpu().numpy()
             axes[row, col].scatter(samples_np[:, 0], samples_np[:, 1], 
-                                 alpha=0.6, c=colors[i], s=20)
+                                alpha=0.6, c=colors[i], s=20)
             axes[row, col].set_title(f'{name.upper()} Flow')
             axes[row, col].grid(True, alpha=0.3)
+
         
-        # Plot training losses - now in bottom-right
+        #####################################################################
+        # Plot training losses - move to bottom-right (axes[1,2])
+        #if flow_losses:
+            # Plot flow losses with reduced alpha
+            #axes[1, 2].plot(flow_losses[0], label='Real-NVP', color='green', linewidth=1, alpha=0.7)
+            #axes[1, 2].plot(flow_losses[1], label='MAF', color='orange', linewidth=1, alpha=0.7)
+
+        # Plot weight learning loss with different scale
+        #if weight_losses:
+            #ax2 = axes[1, 2].twinx()
+            #ax2.plot(weight_losses, label='Weight Learning', color='red', linewidth=2)
+            #ax2.set_ylabel('Weight Loss', color='red')
+            #ax2.tick_params(axis='y', labelcolor='red')
+
+        #axes[1, 2].set_title('Training Losses')
+        #axes[1, 2].set_xlabel('Epoch')
+        #axes[1, 2].set_ylabel('Flow Loss')
+        #axes[1, 2].grid(True, alpha=0.3)
+        #axes[1, 2].legend(loc='upper left')
+        #####################################################################
+        
+        # Plot training losses - move to bottom-right (axes[1,2])
         if flow_losses:
             # Plot flow losses with reduced alpha
-            axes[1, 1].plot(flow_losses[0], label='Real-NVP', color='green', linewidth=1, alpha=0.7)
-            axes[1, 1].plot(flow_losses[1], label='MAF', color='orange', linewidth=1, alpha=0.7)
-        
-        # Plot weight learning loss with different scale
+            axes[1, 2].plot(flow_losses[0], label='Real-NVP', color='green', linewidth=1, alpha=0.7)
+            axes[1, 2].plot(flow_losses[1], label='MAF', color='orange', linewidth=1, alpha=0.7)
+
+        # Plot weight learning loss on SAME scale (remove twinx())
         if weight_losses:
-            ax2 = axes[1, 1].twinx()
-            ax2.plot(weight_losses, label='Weight Learning', color='red', linewidth=2)
-            ax2.set_ylabel('Weight Loss', color='red')
-            ax2.tick_params(axis='y', labelcolor='red')
+            axes[1, 2].plot(weight_losses, label='Weight Learning', color='red', linewidth=2)
+
+        axes[1, 2].set_title('Training Losses')
+        axes[1, 2].set_xlabel('Epoch')
+        axes[1, 2].set_ylabel('Loss')  # Generic label since all on same scale
+        axes[1, 2].grid(True, alpha=0.3)
+        axes[1, 2].legend()  # Remove loc parameter to let matplotlib choose best location
         
-        axes[1, 1].set_title('Training Losses')
-        axes[1, 1].set_xlabel('Epoch')
-        axes[1, 1].set_ylabel('Flow Loss')
-        axes[1, 1].grid(True, alpha=0.3)
-        axes[1, 1].legend(loc='upper left')
+        
+
+        # Hide unused subplot (top-right)
+        axes[0, 2].set_visible(False)
         
         plt.tight_layout()
-        plt.suptitle(f'Sequential AMF-VI Results - {dataset_name.title()}', fontsize=16)
+        plt.suptitle(f'Sequential AMF-VI Results (Moving Avg) - {dataset_name.title()}', fontsize=16)
         
         # Save plot if requested
         if save_plots:
@@ -315,7 +360,7 @@ def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plo
         
         # Check flow diversity and learned weights
         print("\n🔍 Flow Specialization Analysis:")
-        learned_weights = F.softmax(model.log_weights, dim=0).detach().cpu().numpy()
+        learned_weights = model.weights.detach().cpu().numpy()
         for i, (name, samples) in enumerate(flow_samples.items()):
             mean = samples.mean(dim=0).cpu().numpy()
             std = samples.std(dim=0).cpu().numpy()
@@ -330,7 +375,7 @@ def train_sequential_amf_vi(dataset_name='multimodal', show_plots=True, save_plo
             total_params += n_params
             print(f"{flow_names[i].upper()}: {n_params:,} parameters")
         print(f"Total parameters: {total_params:,}")
-        print(f"Weight parameters: {model.log_weights.numel()}")
+        print(f"Weight parameters: {model.weights.numel()}")
     
     # Save trained model
     results_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'results')
