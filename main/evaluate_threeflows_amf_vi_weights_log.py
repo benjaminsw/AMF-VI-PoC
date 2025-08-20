@@ -6,6 +6,7 @@ from sklearn.metrics import pairwise_distances
 from scipy.spatial.distance import cdist
 from threeflows_amf_vi_weights_log import SequentialAMFVI, train_sequential_amf_vi
 from data.data_generator import generate_data
+from amf_vi.kde_kl_divergence import compute_kde_kl_divergence 
 import os
 import pickle
 import csv
@@ -43,17 +44,33 @@ def compute_percentage_improvement(target_samples, mixture_model, baseline_flow)
     return improvement
 
 def compute_kl_divergence_metric(target_samples, flow_model, dataset_name):
-    """Compute KL divergence using direct mathematical approach."""
+    """
+    Compute KL divergence using KDE-based approach as the default method.
+    Falls back to histogram method if KDE fails.
+    """
     with torch.no_grad():
-        # Get flow log probabilities
-        log_q = flow_model.log_prob(target_samples)
-        
-        # Get target log probabilities (this needs to be implemented for each dataset)
-        log_p = get_target_log_prob(dataset_name, target_samples)
-        
-        # For now, fall back to histogram method since we don't have exact target log probs
-        # TODO: Implement exact target log probabilities for each dataset
-        return compute_kl_divergence_histogram(target_samples, flow_model.sample(2000))
+        try:
+            # Generate samples from the flow model
+            generated_samples = flow_model.sample(2000)
+            
+            # Use KDE-based KL divergence as the primary method
+            kl_divergence = compute_kde_kl_divergence(
+                target_samples=target_samples,
+                generated_samples=generated_samples,
+                grid_resolution=100,
+                bandwidth_method='scott',
+                epsilon=1e-10
+            )
+            
+            return kl_divergence
+            
+        except Exception as e:
+            print(f"Warning: KDE-based KL divergence failed for {dataset_name}: {e}")
+            print("Falling back to histogram-based method...")
+            
+            # Fallback to histogram method
+            generated_samples = flow_model.sample(2000)
+            return compute_kl_divergence_histogram(target_samples, generated_samples)
 
 def compute_kl_divergence_histogram(target_samples, generated_samples):
     """Compute KL divergence between target and generated samples using histogram method."""
@@ -359,27 +376,37 @@ def comprehensive_sequential_evaluation():
     print(f"\n{'='*80}")
     print("SEQUENTIAL SUMMARY TABLE - MIXTURE RESULTS")
     print(f"{'='*80}")
-    print(f"{'Dataset':<15} | {'Flow':<8} | {'KL Divergence':<12} | {'Cross-Entropy':<12} | {'% Improvement':<12} | {'Flow Sep':<8} | {'Weights Trained':<14}")
-    print("-" * 110)
+    print(f"{'Dataset':<15} | {'KL Divergence':<12} | {'Cross-Entropy':<12} | {'Flow':<8} | {'Flow KL':<8} | {'Flow CE':<8} | {'Weight':<8} | {'% Improvement':<12} | {'Flow Sep':<8} | {'Weights Trained':<14}")
+    print("-" * 140)
     
     summary_data = []
     for dataset_name, results in all_results.items():
         weights_status = "Yes" if results['weights_trained'] else "No"
         
-        # UPDATED: Add rows for all flows dynamically
-        for flow_name in results['flow_names']:
+        # UPDATED: Add rows for all flows dynamically with individual flow metrics
+        for i, flow_name in enumerate(results['flow_names']):
             improvement_key = f'vs_{flow_name}'
             improvement = results['percentage_improvements'].get(improvement_key, 0.0)
             
-            print(f"{dataset_name:<15} | {flow_name.upper():<8} | {results['kl_divergence']:<12.3f} | "
-                  f"{results['cross_entropy_surrogate']:<12.3f} | {improvement:<12.1f} | "
-                  f"{results['flow_separation']:<8.3f} | {weights_status:<14}")
+            # Get individual flow metrics
+            individual_metrics = results['individual_flow_metrics'].get(flow_name, {})
+            flow_kl = individual_metrics.get('kl_divergence', 0.0)
+            flow_ce = individual_metrics.get('cross_entropy_surrogate', 0.0)
+            flow_weight = results['learned_weights'][i] if results['weights_trained'] else 1/len(results['learned_weights'])
+            
+            print(f"{dataset_name:<15} | {results['kl_divergence']:<12.3f} | "
+                  f"{results['cross_entropy_surrogate']:<12.3f} | {flow_name.upper():<8} | "
+                  f"{flow_kl:<8.3f} | {flow_ce:<8.3f} | {flow_weight:<8.3f} | "
+                  f"{improvement:<12.1f} | {results['flow_separation']:<8.3f} | {weights_status:<14}")
             
             summary_data.append([
                 dataset_name,
-                flow_name.upper(),
                 results['kl_divergence'],
                 results['cross_entropy_surrogate'],
+                flow_name.upper(),
+                flow_kl,
+                flow_ce,
+                flow_weight,
                 improvement,
                 results['flow_separation'],
                 weights_status
@@ -388,7 +415,7 @@ def comprehensive_sequential_evaluation():
     # Save mixture metrics to CSV with new metrics
     with open(os.path.join(results_dir, 'sequential_comprehensive_metrics.csv'), 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['dataset', 'flow', 'kl_divergence', 'cross_entropy_surrogate', 'percentage_improvement', 'flow_separation', 'weights_trained'])
+        writer.writerow(['dataset', 'mixture_kl_divergence', 'mixture_cross_entropy_surrogate', 'flow', 'flow_kl_divergence', 'flow_cross_entropy_surrogate', 'flow_weight', 'percentage_improvement', 'flow_separation', 'weights_trained'])
         writer.writerows(summary_data)
     
     # Create individual flow metrics CSV with new metrics
